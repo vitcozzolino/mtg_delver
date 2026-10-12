@@ -32,7 +32,7 @@ uv run python server.py
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. The server asks TopDeck for Pioneer events and their published decklists; the recency slider uses 1–90 days. The UI visibly credits TopDeck when that source is active.
 
-The frontend remains plain HTML, CSS, and JavaScript. Python is only the local API server that keeps the TopDeck key out of the browser. `uv` creates an isolated `.venv` and locks the project in `uv.lock`; there are currently no third-party dependencies. Never commit a real key; `.env.example` is only a naming reference.
+The frontend remains plain HTML, CSS, and JavaScript. Python is only the local API server that keeps the TopDeck key out of the browser. `uv` creates an isolated `.venv` and locks the project in `uv.lock`; there are currently no third-party dependencies. TopDeck only contributes completed events with public decklists; when it has no usable Pioneer lists, the UI visibly falls back to the public MTGO feed. Never commit a real key; `.env.example` is only a naming reference.
 
 Any importer should normalize records into this shape:
 

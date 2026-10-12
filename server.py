@@ -71,7 +71,13 @@ def fetch_topdeck(days: int) -> dict:
         TOPDECK_URL,
         data=payload,
         method="POST",
-        headers={"Authorization": api_key, "Content-Type": "application/json"},
+        headers={
+            "Authorization": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Cloudflare rejects urllib's default `Python-urllib/x.y` identifier.
+            "User-Agent": "mtg-delver/0.1 (+https://github.com/vitcozzolino/mtg_delver)",
+        },
     )
     try:
         with urlopen(request, timeout=30) as response:
@@ -112,6 +118,12 @@ def fetch_topdeck(days: int) -> dict:
             "decks_cached": len(decks),
             "decks": decks,
         })
+    published_deck_count = sum(len(event["decks"]) for event in events)
+    if not published_deck_count:
+        raise RuntimeError(
+            f"TopDeck returned {len(events)} Pioneer events but no publicly available decklists "
+            f"in the selected {days}-day window"
+        )
     return {
         "schema_version": "1",
         "kind": "topdeck_pioneer_decklists",
