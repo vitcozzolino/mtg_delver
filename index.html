@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Pioneer archetype deck explorer" />
+    <title>Delver — Pioneer Deck Explorer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Fraunces:opsz,wght@9..144,600;9..144,700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#">delver<span>_</span></a>
+        <div class="format-pill" id="dataStatus"><span class="status-dot"></span> Loading live Pioneer data…</div>
+        <button class="ghost-button" id="aboutButton">How it works</button>
+      </header>
+
+      <section class="hero">
+        <p class="eyebrow">ARCHETYPE RESEARCH WORKBENCH</p>
+        <h1>Keep the identity.<br /><em>Find the edge.</em></h1>
+        <p class="hero-copy">Compare recent lists in an archetype, separate its backbone from its flex slots, and turn meaningful differences into focused tests.</p>
+      </section>
+
+      <section class="control-panel" aria-label="Deck explorer controls">
+        <div class="field archetype-field">
+          <label for="archetypeSelect">Archetype</label>
+          <select id="archetypeSelect"></select>
+        </div>
+        <div class="field deck-field">
+          <label for="deckSelect">Your starting list</label>
+          <select id="deckSelect"></select>
+        </div>
+        <div class="field range-field">
+          <label for="recencyRange">Recency window <output id="rangeOutput">30 days</output></label>
+          <input id="recencyRange" type="range" min="7" max="90" step="1" value="30" />
+        </div>
+        <button id="analyzeButton" class="primary-button">Analyze archetype <span>→</span></button>
+        <button id="refreshData" class="refresh-button" title="Refresh the live MTGO feed">↻</button>
+      </section>
+
+      <p class="data-note" id="dataNote"></p>
+
+      <section class="summary-grid" id="summaryGrid" aria-live="polite"></section>
+
+      <section class="workspace">
+        <div class="panel deck-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">YOUR BASELINE</p>
+              <h2 id="baselineTitle">—</h2>
+            </div>
+            <span class="deck-meta" id="baselineMeta"></span>
+          </div>
+          <div id="deckList" class="deck-list"></div>
+        </div>
+
+        <div class="panel insights-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">ARCHETYPE SIGNAL</p>
+              <h2>What the lists agree on</h2>
+            </div>
+            <span class="legend"><i class="core-dot"></i> core <i class="flex-dot"></i> flex<br /><strong>3×</strong> = copies in your list · <strong>2/4</strong> = sampled lists containing it</span>
+          </div>
+          <div id="coreCards" class="card-cloud"></div>
+          <div class="divider"></div>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">WHERE THEY SPLIT</p>
+              <h2>Variant packages</h2>
+            </div>
+          </div>
+          <div id="packages" class="package-list"></div>
+        </div>
+      </section>
+
+      <section class="panel experiment-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">CONTROLLED EXPERIMENTS</p>
+            <h2>Potential next tests</h2>
+          </div>
+          <p class="panel-note">Suggestions preserve the cards found in most sampled lists.</p>
+        </div>
+        <div id="experiments" class="experiment-list"></div>
+      </section>
+    </main>
+
+    <aside id="cardPreview" class="card-preview" aria-live="polite" aria-hidden="true">
+      <div class="preview-loading">Loading card…</div>
+    </aside>
+
+    <dialog id="aboutDialog">
+      <button class="close-button" id="closeAbout" aria-label="Close">×</button>
+      <p class="eyebrow">THE METHOD</p>
+      <h2>Evidence before novelty.</h2>
+      <p>Delver treats a card as archetype core when it appears in at least two thirds of the sampled lists. Everything else is a flex slot. Test ideas come from successful lists that use a coherent alternative package, then suggest a same-role cut from your own list.</p>
+      <p class="dialog-note">This demo ships with sample deck snapshots. Connect a tournament/decklist source before relying on it for current metagame decisions.</p>
+    </dialog>
+
+    <template id="experimentTemplate">
+      <article class="experiment-card">
+        <div class="experiment-number"></div>
+        <div class="experiment-body">
+          <p class="experiment-kicker"></p>
+          <h3></h3>
+          <p class="experiment-reason"></p>
+          <div class="swap-row"></div>
+        </div>
+        <button class="queue-button">Queue test <span>+</span></button>
+      </article>
+    </template>
+    <script src="./app.js"></script>
+  </body>
+</html>
