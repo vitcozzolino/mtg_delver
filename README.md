@@ -18,8 +18,15 @@ By default, the live loader fetches `data/latest/mtgo-decklists/pioneer.json` fr
 
 The app includes a local-only TopDeck API adapter. It keeps your key on your machine rather than exposing it in browser JavaScript.
 
+Save the key once (the prompt is hidden and writes a gitignored `.env` file):
+
 ```bash
-export TOPDECK_API_KEY='your-key-here'
+python3 setup_key.py
+```
+
+After that, starting the Python backend needs no export or key entry:
+
+```bash
 python3 server.py
 ```
 

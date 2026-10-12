@@ -20,6 +20,24 @@ ROOT = Path(__file__).parent
 TOPDECK_URL = "https://topdeck.gg/api/v2/tournaments"
 
 
+def load_local_env() -> None:
+    """Load the project's local .env without adding a third-party dependency."""
+    env_file = ROOT / ".env"
+    if not env_file.is_file():
+        return
+    for raw_line in env_file.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip("'\"")
+        if key.strip() and value:
+            os.environ.setdefault(key.strip(), value)
+
+
+load_local_env()
+
+
 def to_deck_text(deck: object) -> str:
     if isinstance(deck, str):
         return deck
