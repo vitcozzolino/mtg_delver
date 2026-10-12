@@ -45,16 +45,19 @@ const MIN_LOADING_FEEDBACK_MS = 800;
 
 function setLoading(isLoading, title = 'Loading current decklists', detail = 'Connecting to the tournament sources…') {
   const overlay = $('#loadingOverlay');
+  const progress = $('#syncProgress');
   const refresh = $('#refreshData');
   const analyze = $('#analyzeButton');
   clearInterval(loadingMessageTimer);
   overlay.hidden = !isLoading;
+  progress.hidden = !isLoading;
   document.body.classList.toggle('is-loading', isLoading);
   document.querySelector('.app-shell').setAttribute('aria-busy', String(isLoading));
   [selectArchetype, selectDeck, range, refresh, analyze].forEach(control => { control.disabled = isLoading; });
   refresh.classList.toggle('is-spinning', isLoading);
   if (!isLoading) return;
   $('#loadingTitle').textContent = title;
+  $('#syncProgressLabel').textContent = 'Loading data…';
   const messages = [detail, 'Normalizing decklists and finding archetype matches…', 'Comparing the shared core against flex slots…'];
   let messageIndex = 0;
   $('#loadingDetail').textContent = messages[messageIndex];
