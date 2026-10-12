@@ -8,5 +8,7 @@ __pycache__/
 delver-cache.sqlite3
 decklinks.txt
 decklists.zip
+decklists/
+progress.json
 delver-cache.sqlite3-shm
 delver-cache.sqlite3-wal
