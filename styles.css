@@ -30,6 +30,7 @@ body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity
 .ghost-button { color:var(--muted); }.ghost-button:hover { color:var(--acid); }
 .hero { max-width:850px; }.hero-copy { max-width:650px; }
 .control-panel { position:relative; overflow:hidden; background:linear-gradient(135deg, rgba(27,36,48,.94), rgba(15,20,28,.94)); border:1px solid rgba(158,172,187,.2); box-shadow:var(--shadow); }.control-panel::before { content:""; position:absolute; inset:0 0 auto; height:1px; background:linear-gradient(90deg, transparent, rgba(185,245,106,.65), transparent); }
+.control-panel { grid-template-columns:1.15fr 1.15fr 1fr .72fr auto auto; }
 .field select { background:#0d131b; border-color:#334151; color:var(--ink); box-shadow:inset 0 1px rgba(255,255,255,.025); }.field select:focus,.range-field input:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }.range-field input { accent-color:var(--acid); }
 .primary-button { background:var(--acid); color:#10150c; box-shadow:0 7px 22px rgba(185,245,106,.18); }.primary-button span { color:#4d7118; }.primary-button:hover { background:#d0ff8b; }.refresh-button { background:#141b24; border-color:#3a495a; color:var(--ink); }.refresh-button:hover { border-color:var(--acid); color:var(--acid); }.refresh-button.is-spinning { animation:spin 1s linear infinite; }
 .data-note strong,.data-note a,.legend strong { color:var(--ink); }.data-note a:hover { color:var(--acid); }

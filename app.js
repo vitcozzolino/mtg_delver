@@ -35,6 +35,7 @@ const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_
 const selectArchetype = document.querySelector('#archetypeSelect');
 const selectDeck = document.querySelector('#deckSelect');
 const range = document.querySelector('#recencyRange');
+const supplementLimit = document.querySelector('#supplementLimit');
 const $ = (selector) => document.querySelector(selector);
 const isLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
 const cardPreview = $('#cardPreview');
@@ -55,7 +56,7 @@ function setLoading(isLoading, title = 'Loading current decklists', detail = 'Co
   progress.hidden = !isLoading;
   document.body.classList.toggle('is-loading', isLoading);
   document.querySelector('.app-shell').setAttribute('aria-busy', String(isLoading));
-  [selectArchetype, selectDeck, range, refresh, analyze].forEach(control => { control.disabled = isLoading; });
+  [selectArchetype, selectDeck, range, supplementLimit, refresh, analyze].forEach(control => { control.disabled = isLoading; });
   refresh.classList.toggle('is-spinning', isLoading);
   if (!isLoading) return;
   $('#loadingTitle').textContent = title;
@@ -117,7 +118,7 @@ async function enrichArchetype(archetype, days, { showLoading = false } = {}) {
   if (showLoading) setLoading(true, `Expanding ${archetype}`, 'Loading additional published tournament lists…');
   else $('#loadingDetail').textContent = 'Loading additional published tournament lists…';
   try {
-    const response = await fetch(`${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}`, { cache: 'no-store' });
+    const response = await fetch(`${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}`, { cache: 'no-store' });
     if (!response.ok) throw new Error('Supplemental archetype source was unavailable');
     const supplemental = buildLiveDatasets(await response.json())[archetype];
     if (!supplemental || token !== archetypeLoadToken || !datasets[archetype]) return;
@@ -314,6 +315,7 @@ range.addEventListener('input', () => { $('#rangeOutput').textContent = `${range
 range.addEventListener('change', () => {
   if (!$('#dataStatus').textContent.includes('public fallback')) loadLiveData();
 });
+supplementLimit.addEventListener('change', loadLiveData);
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', loadLiveData);
 $('#aboutButton').addEventListener('click', () => $('#aboutDialog').showModal());

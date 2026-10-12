@@ -30,7 +30,7 @@ MAX_VIDERE_DECKS = 1_000
 SOURCE_CACHE_TTL_SECONDS = 300
 SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
 ARCHETYPE_CACHE_TTL_SECONDS = 1_800
-ARCHETYPE_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
+ARCHETYPE_CACHE: dict[tuple[str, int, int], tuple[float, dict]] = {}
 MAX_ARCHETYPE_DECKS = 20
 
 
@@ -107,13 +107,14 @@ def archetype_slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def fetch_mtgdecklists_archetype(archetype: str, days: int) -> dict:
+def fetch_mtgdecklists_archetype(archetype: str, days: int, limit: int = MAX_ARCHETYPE_DECKS) -> dict:
     """Fetch a small, cached public sample for one requested Pioneer archetype.
 
     MTG Decklists permits crawling in robots.txt. This deliberately loads at
     most 20 recent pages and caches results for 30 minutes.
     """
-    cache_key = (archetype.lower(), days)
+    limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
+    cache_key = (archetype.lower(), days, limit)
     cached = ARCHETYPE_CACHE.get(cache_key)
     if cached and time.monotonic() - cached[0] < ARCHETYPE_CACHE_TTL_SECONDS:
         return cached[1]
@@ -145,7 +146,7 @@ def fetch_mtgdecklists_archetype(archetype: str, days: int) -> dict:
             "result": parts[1],
             "event": " · ".join(parts[2:]),
         })
-        if len(entries) >= MAX_ARCHETYPE_DECKS:
+        if len(entries) >= limit:
             break
 
     def load_deck(entry: dict) -> dict | None:
@@ -467,11 +468,12 @@ class DelverHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             archetype = query.get("name", [""])[0].strip()
             days = int(query.get("days", [90])[0])
+            limit = int(query.get("limit", [MAX_ARCHETYPE_DECKS])[0])
             days = max(1, min(days, 90))
             if not archetype:
                 return self._send_json(400, {"error": "An archetype name is required"})
             try:
-                return self._send_json(200, fetch_mtgdecklists_archetype(archetype, days))
+                return self._send_json(200, fetch_mtgdecklists_archetype(archetype, days, limit))
             except (RuntimeError, ValueError) as error:
                 return self._send_json(502, {"error": str(error)})
         if parsed.path != "/api/pioneer":
