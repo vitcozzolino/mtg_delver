@@ -18,6 +18,8 @@ By default, the live loader fetches `data/latest/mtgo-decklists/pioneer.json` fr
 
 The default backend now merges two evidence-grade sources: Videre's public MTGO deck API and Spicerack's public completed-tournament decklist API. It requests the selected 1–90 day Pioneer window, de-duplicates identical mainboards, and preserves each list's source URL. A temporarily slow or unavailable source is recorded as a warning without blocking results from the other source.
 
+For the selected archetype, Delver also loads capped, cached supplemental lists from MTG Decklists and MTGContent's public Pioneer search. Source labels remain visible and identical decks are de-duplicated before comparison.
+
 ## Moxfield community lists (optional)
 
 Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set this read-only identifier in your local `.env` file:

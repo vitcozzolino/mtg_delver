@@ -32,6 +32,7 @@ let datasets = {};
 const TOPDECK_FEED_URL = '/api/pioneer';
 const ARCHETYPE_FEED_URL = '/api/archetype';
 const COMMUNITY_FEED_URL = '/api/community';
+const MTGCONTENT_FEED_URL = '/api/content';
 const CARD_PROFILE_URL = '/api/card-profiles';
 const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_Data/data-publish/data/latest/mtgo-decklists/pioneer.json';
 const selectArchetype = document.querySelector('#archetypeSelect');
@@ -140,7 +141,10 @@ function parseMainboard(deckText) {
   for (const line of deckText.split(/\r?\n/)) {
     if (/^sideboard\s*$/i.test(line.trim())) break;
     const match = line.match(/^(\d+)\s+(.+)$/);
-    if (match) cards[match[2].trim()] = Number(match[1]);
+    if (match) {
+      const name = match[2].trim();
+      cards[name] = (cards[name] || 0) + Number(match[1]);
+    }
   }
   return cards;
 }
@@ -187,6 +191,9 @@ async function enrichArchetype(archetype, days, { showLoading = false, forceRefr
     const sources = [{
       label: 'MTG Decklists',
       url: `${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`,
+    }, {
+      label: 'MTGContent',
+      url: `${MTGCONTENT_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`,
     }];
     if (moxfieldEnabled.checked) sources.push({
       label: 'Moxfield community',

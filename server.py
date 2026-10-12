@@ -27,6 +27,7 @@ TOPDECK_URL = "https://topdeck.gg/api/v2/tournaments"
 VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
 SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
 MTG_DECKLISTS_URL = "https://mtgdecklists.com"
+MTGCONTENT_DECKLISTS_URL = "https://www.mtgcontent.com/decklists/browse"
 MOXFIELD_API_URL = "https://api2.moxfield.com"
 MAX_VIDERE_DECKS = 1_000
 CACHE_DB = ROOT / "delver-cache.sqlite3"
@@ -385,6 +386,118 @@ def fetch_mtgdecklists_archetype_live(archetype: str, days: int, limit: int) -> 
         }],
     }
     return payload
+
+
+def mtgcontent_date(value: object) -> str:
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, "%b %d, %Y").date().isoformat()
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def mtgcontent_mainboard(cards: object) -> str:
+    if not isinstance(cards, list):
+        return ""
+    lines: list[str] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        name = card.get("name")
+        quantity = card.get("quantity")
+        if isinstance(name, str) and isinstance(quantity, int) and quantity > 0:
+            lines.append(f"{quantity} {name}")
+    return "\n".join(lines)
+
+
+def parse_mtgcontent_decks(page: str) -> list[dict]:
+    """Extract deck objects embedded in MTGContent's public server-rendered page."""
+    payload = page.replace(r'\"', '"')
+    decoder = json.JSONDecoder()
+    decks: list[dict] = []
+    seen: set[str] = set()
+    for match in re.finditer(r'\{"id":"', payload):
+        try:
+            record, _ = decoder.raw_decode(payload[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or not isinstance(record.get("cards"), dict):
+            continue
+        deck_id = record.get("id")
+        if not isinstance(deck_id, str) or deck_id in seen:
+            continue
+        mainboard = mtgcontent_mainboard(record["cards"].get("mainboard"))
+        if not mainboard:
+            continue
+        seen.add(deck_id)
+        decks.append({
+            "number": deck_id,
+            "date": mtgcontent_date(record.get("displayDate")),
+            "event": record.get("eventName") or "MTGContent published result",
+            "result": record.get("result") or "Published list",
+            "player": record.get("pilotUsername") or "Unknown player",
+            "archetype": record.get("archetype") or "Unknown",
+            "source": "mtgcontent",
+            "format": "pioneer",
+            "deck_text": mainboard,
+            "source_url": record.get("url") or "https://www.mtgcontent.com/decklists",
+        })
+    return decks
+
+
+def fetch_mtgcontent_archetype(
+    archetype: str,
+    days: int,
+    limit: int = MAX_ARCHETYPE_DECKS,
+    *,
+    force_refresh: bool = False,
+) -> dict:
+    limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
+    cache_key = f"mtgcontent:{archetype_slug(archetype)}:{days}:{limit}"
+    return cached_fetch(
+        cache_key,
+        ARCHETYPE_CACHE_TTL_SECONDS,
+        lambda: fetch_mtgcontent_archetype_live(archetype, days, limit),
+        force_refresh=force_refresh,
+    )
+
+
+def fetch_mtgcontent_archetype_live(archetype: str, days: int, limit: int) -> dict:
+    from urllib.parse import urlencode
+
+    start_date = datetime.now(timezone.utc).date().fromordinal(
+        datetime.now(timezone.utc).date().toordinal() - days
+    )
+    query = urlencode({
+        "format": "pioneer",
+        "type": "all",
+        "deck": archetype,
+        "from": start_date.isoformat(),
+    })
+    list_url = f"{MTGCONTENT_DECKLISTS_URL}?{query}"
+    decks = [
+        deck for deck in parse_mtgcontent_decks(fetch_html(list_url))
+        if deck["archetype"].casefold() == archetype.casefold() and deck["date"] >= start_date.isoformat()
+    ][:limit]
+    return {
+        "schema_version": "1",
+        "kind": "mtgcontent_pioneer_archetype",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "format": "pioneer",
+        "source": "mtgcontent",
+        "days": days,
+        "events": [{
+            "id": f"mtgcontent-{archetype_slug(archetype)}",
+            "url": list_url,
+            "title": f"MTGContent · {archetype}",
+            "publish_date": datetime.now(timezone.utc).date().isoformat(),
+            "event_type": "archetype_sample",
+            "decks_total": len(decks),
+            "decks_cached": len(decks),
+            "decks": decks,
+        }],
+    }
 
 
 def nonnegative_int_env(name: str, default: int) -> int:
@@ -855,6 +968,21 @@ class DelverHandler(SimpleHTTPRequestHandler):
                 return self._send_json(400, {"error": "An archetype name is required"})
             try:
                 return self._send_json(200, fetch_moxfield_archetype(
+                    archetype, days, limit, force_refresh=force_refresh
+                ))
+            except (RuntimeError, ValueError) as error:
+                return self._send_json(502, {"error": str(error)})
+        if parsed.path == "/api/content":
+            query = parse_qs(parsed.query)
+            archetype = query.get("name", [""])[0].strip()
+            days = int(query.get("days", [90])[0])
+            limit = int(query.get("limit", [MAX_ARCHETYPE_DECKS])[0])
+            force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
+            days = max(1, min(days, 90))
+            if not archetype:
+                return self._send_json(400, {"error": "An archetype name is required"})
+            try:
+                return self._send_json(200, fetch_mtgcontent_archetype(
                     archetype, days, limit, force_refresh=force_refresh
                 ))
             except (RuntimeError, ValueError) as error:
