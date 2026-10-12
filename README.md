@@ -26,6 +26,10 @@ The **Import saved HTML** control reads saved `.html` deck pages directly in the
 
 An archetype overview page is useful for finding links, but it has no card lists to analyze; Delver will report how many deck links it found and ask for the individual saved deck pages.
 
+### Local Phoenix archive
+
+If `decklists.zip` is beside `server.py`, Delver reads it locally and adds verified **Arclight Phoenix** mainboards to Izzet Phoenix only. The archive never triggers a network request. It is explicitly marked as historical and is included alongside the chosen recent window so older, coherent Phoenix packages remain visible without being mistaken for current tournament data.
+
 ## Moxfield community lists (optional)
 
 Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set this read-only identifier in your local `.env` file:

@@ -33,6 +33,7 @@ const TOPDECK_FEED_URL = '/api/pioneer';
 const ARCHETYPE_FEED_URL = '/api/archetype';
 const COMMUNITY_FEED_URL = '/api/community';
 const MTGCONTENT_FEED_URL = '/api/content';
+const LOCAL_PHOENIX_ARCHIVE_URL = '/api/local-phoenix-archive';
 const CARD_PROFILE_URL = '/api/card-profiles';
 const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_Data/data-publish/data/latest/mtgo-decklists/pioneer.json';
 const selectArchetype = document.querySelector('#archetypeSelect');
@@ -171,7 +172,8 @@ function buildLiveDatasets(feed) {
       ageDays,
       cards,
       player: record.player,
-      sourceUrl: record.event.url
+      sourceUrl: record.event.url,
+      historicalArchive: Boolean(record.historical_archive)
     });
   });
   return Object.fromEntries(Object.entries(grouped)
@@ -327,6 +329,10 @@ async function enrichArchetype(archetype, days, { showLoading = false, forceRefr
       label: 'MTGContent',
       url: `${MTGCONTENT_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`,
     }];
+    if (archetype === 'Izzet Phoenix') sources.push({
+      label: 'local Phoenix archive',
+      url: LOCAL_PHOENIX_ARCHIVE_URL,
+    });
     if (moxfieldEnabled.checked) sources.push({
       label: 'Moxfield community',
       url: `${COMMUNITY_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`,
@@ -495,7 +501,7 @@ function updateDeckChoices() {
 function getAnalysis() {
   const data = datasets[selectArchetype.value];
   const base = data.decks[Number(selectDeck.value)];
-  const decks = data.decks.filter(deck => deck.ageDays <= Number(range.value));
+  const decks = data.decks.filter(deck => deck.historicalArchive || deck.ageDays <= Number(range.value));
   if (!decks.includes(base)) decks.unshift(base);
   const totals = {};
   decks.forEach(deck => Object.entries(deck.cards).forEach(([card, quantity]) => {
@@ -528,7 +534,9 @@ function renderDeck(analysis) {
 function renderAnalysis(analysis) {
   const totalCards = Object.values(analysis.base.cards).reduce((a,b)=>a+b,0);
   const flexInBase = Object.keys(analysis.base.cards).filter(card => !isLand(card) && analysis.totals[card].appearances < analysis.threshold).reduce((sum,card)=>sum+analysis.base.cards[card],0);
-  $('#dataNote').innerHTML = `<strong>${analysis.decks.length} sampled lists</strong> · window set to ${range.value} days · ${analysis.data.note} · <a href="${analysis.data.sourceUrl}" target="_blank" rel="noreferrer">View source snapshot ↗</a>`;
+  const historicalCount = analysis.decks.filter(deck => deck.historicalArchive && deck.ageDays > Number(range.value)).length;
+  const historicalNote = historicalCount ? ` · includes ${historicalCount} historical local Phoenix archive list${historicalCount === 1 ? '' : 's'}` : '';
+  $('#dataNote').innerHTML = `<strong>${analysis.decks.length} sampled lists</strong> · window set to ${range.value} days${historicalNote} · ${analysis.data.note} · <a href="${analysis.data.sourceUrl}" target="_blank" rel="noreferrer">View source snapshot ↗</a>`;
   $('#summaryGrid').innerHTML = [[analysis.decks.length,'sampled lists'],[analysis.core.length,'backbone cards'],[flexInBase,'flex slots in baseline'],[totalCards,'cards indexed']].map(([value,label])=>`<div class="stat"><div class="stat-value">${value}</div><div class="stat-label">${label}</div></div>`).join('');
   $('#coreCards').innerHTML = analysis.core.map(([name, info]) => `<span class="signal-card" data-card-name="${name}" tabindex="0">${name}<b>${info.appearances}/${analysis.decks.length}</b></span>`).join('') || '<p>No shared nonland cards in the current sample.</p>';
   const packageGroups = analysis.variants.sort((a,b)=>b[1].appearances-a[1].appearances).slice(0,4);

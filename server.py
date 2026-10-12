@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import time
+import zipfile
 from errno import EADDRINUSE
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ SOURCE_CACHE_TTL_SECONDS = 30 * 60
 ARCHETYPE_CACHE_TTL_SECONDS = 6 * 60 * 60
 CARD_PROFILE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_ARCHETYPE_DECKS = 20
+LOCAL_DECK_ARCHIVE = ROOT / "decklists.zip"
 
 
 def load_local_env() -> None:
@@ -192,6 +194,97 @@ def fetch_html(url: str, timeout: int = 20) -> str:
 
 def html_text(value: str) -> str:
     return unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def mtgdecks_arena_mainboard(page: str) -> str:
+    """Read a saved MTGDecks Arena export without making any network request."""
+    match = re.search(
+        r'<textarea[^>]*id=["\']arena_deck["\'][^>]*>(?P<deck>.*?)</textarea>',
+        page,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    deck_text = unescape(match.group("deck")).replace("\r\n", "\n").strip()
+    return re.split(r"\n\s*Sideboard\s*\n", deck_text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+
+def local_archive_metadata(page: str, file_name: str) -> dict[str, str]:
+    description_match = re.search(
+        r'<meta\s+name=["\']description["\']\s+content=["\'](?P<description>.*?)["\']',
+        page,
+        re.IGNORECASE | re.DOTALL,
+    )
+    description = unescape(description_match.group("description")) if description_match else ""
+    details_match = re.search(
+        r"played by (?P<player>.*?) in (?P<event>.*?) on (?P<date>20\d{2}-\d{2}-\d{2})",
+        description,
+        re.IGNORECASE,
+    )
+    title_match = re.search(r"<title>(?P<title>.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+    title = html_text(title_match.group("title")) if title_match else file_name
+    return {
+        "player": details_match.group("player").strip() if details_match else "Unknown player",
+        "event": details_match.group("event").strip() if details_match else "Saved MTGDecks page",
+        "date": details_match.group("date") if details_match else datetime.now(timezone.utc).date().isoformat(),
+        "title": title.replace("• MTG DECKS", "").strip(),
+    }
+
+
+def fetch_local_phoenix_archive() -> dict:
+    """Import user-supplied saved pages, keeping only real Phoenix mainboards.
+
+    The archive is local data supplied by the user. It is deliberately not
+    fetched from MTGDecks and it is marked historical in the returned payload.
+    """
+    if not LOCAL_DECK_ARCHIVE.is_file():
+        raise RuntimeError("Local deck archive not found. Add decklists.zip beside server.py.")
+    decks: list[dict] = []
+    with zipfile.ZipFile(LOCAL_DECK_ARCHIVE) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or not info.filename.lower().endswith((".html", ".htm")):
+                continue
+            if info.file_size > 2_000_000:
+                continue
+            page = archive.read(info).decode("utf-8", errors="replace")
+            deck_text = mtgdecks_arena_mainboard(page)
+            cards = to_deck_text(deck_text)
+            if not re.search(r"^\d+\s+Arclight Phoenix\s*$", cards, re.IGNORECASE | re.MULTILINE):
+                continue
+            metadata = local_archive_metadata(page, Path(info.filename).name)
+            decks.append({
+                "date": metadata["date"],
+                "event": metadata["event"],
+                "result": "Historical local archive",
+                "player": metadata["player"],
+                "archetype": "Izzet Phoenix",
+                "source": "local-archive",
+                "format": "pioneer",
+                "deck_text": cards,
+                "source_url": "",
+                "historical_archive": True,
+                "title": metadata["title"],
+            })
+    if not decks:
+        raise RuntimeError("No Izzet Phoenix mainboards found in the local deck archive.")
+    decks.sort(key=lambda deck: (deck["date"], deck["player"]), reverse=True)
+    return {
+        "schema_version": "1",
+        "kind": "local_izzet_phoenix_archive",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "format": "pioneer",
+        "source": "local-archive",
+        "events": [{
+            "id": "local-izzet-phoenix-archive",
+            "url": "",
+            "title": "Local saved Izzet Phoenix archive",
+            "publish_date": datetime.now(timezone.utc).date().isoformat(),
+            "event_type": "historical_archive",
+            "decks_total": len(decks),
+            "decks_cached": len(decks),
+            "decks": decks,
+        }],
+    }
 
 
 def card_profile_from_scryfall(card: object) -> dict:
@@ -987,6 +1080,11 @@ class DelverHandler(SimpleHTTPRequestHandler):
                 ))
             except (RuntimeError, ValueError) as error:
                 return self._send_json(502, {"error": str(error)})
+        if parsed.path == "/api/local-phoenix-archive":
+            try:
+                return self._send_json(200, fetch_local_phoenix_archive())
+            except (RuntimeError, ValueError, zipfile.BadZipFile) as error:
+                return self._send_json(404, {"error": str(error)})
         if parsed.path != "/api/pioneer":
             return super().do_GET()
         query = parse_qs(parsed.query)
