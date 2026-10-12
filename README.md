@@ -18,6 +18,22 @@ By default, the live loader fetches `data/latest/mtgo-decklists/pioneer.json` fr
 
 The default backend now merges two evidence-grade sources: Videre's public MTGO deck API and Spicerack's public completed-tournament decklist API. It requests the selected 1–90 day Pioneer window, de-duplicates identical mainboards, and preserves each list's source URL. A temporarily slow or unavailable source is recorded as a warning without blocking results from the other source.
 
+## Moxfield community lists (optional)
+
+Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set one of these values in your local `.env` file:
+
+```bash
+# Current browser-session bearer token, or a read-only User-Agent issued by Moxfield.
+MOXFIELD_AUTH_TOKEN=replace-with-your-token
+MOXFIELD_USER_AGENT=
+
+# Quality guardrails for community lists; either threshold qualifies a list.
+MOXFIELD_MIN_VIEWS=50
+MOXFIELD_MIN_LIKES=2
+```
+
+The Moxfield integration uses its unofficial read API. It searches recent Pioneer deck names, rejects lists with fewer than 60 mainboard cards, applies the view/like thresholds, and then reads at most the selected **per-source cap** (5, 10, or 20). Results are cached locally for six hours. No credential is sent to browser JavaScript.
+
 ## TopDeck key (optional)
 
 The app includes a local-only TopDeck API adapter. It keeps your key on your machine rather than exposing it in browser JavaScript.

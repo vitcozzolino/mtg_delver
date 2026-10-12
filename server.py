@@ -27,6 +27,7 @@ TOPDECK_URL = "https://topdeck.gg/api/v2/tournaments"
 VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
 SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
 MTG_DECKLISTS_URL = "https://mtgdecklists.com"
+MOXFIELD_API_URL = "https://api2.moxfield.com"
 MAX_VIDERE_DECKS = 1_000
 CACHE_DB = ROOT / "delver-cache.sqlite3"
 SOURCE_CACHE_TTL_SECONDS = 30 * 60
@@ -141,11 +142,14 @@ def iso_date(unix_seconds: object) -> str:
         return datetime.now(timezone.utc).date().isoformat()
 
 
-def fetch_json(url: str, timeout: int = 20) -> object:
-    request = Request(url, headers={
+def fetch_json(url: str, timeout: int = 20, headers: dict[str, str] | None = None) -> object:
+    request_headers = {
         "Accept": "application/json",
         "User-Agent": "mtg-delver/0.1 (+https://github.com/vitcozzolino/mtg_delver)",
-    })
+    }
+    if headers:
+        request_headers.update(headers)
+    request = Request(url, headers=request_headers)
     try:
         with urlopen(request, timeout=timeout) as response:
             return json.load(response)
@@ -284,6 +288,188 @@ def fetch_mtgdecklists_archetype_live(archetype: str, days: int, limit: int) -> 
             "title": f"MTG Decklists · {archetype}",
             "publish_date": datetime.now(timezone.utc).date().isoformat(),
             "event_type": "archetype_sample",
+            "decks_total": len(decks),
+            "decks_cached": len(decks),
+            "decks": decks,
+        }],
+    }
+    return payload
+
+
+def nonnegative_int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def integer_value(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def moxfield_headers() -> dict[str, str]:
+    """Return optional Moxfield credentials without exposing them to the browser."""
+    token = os.environ.get("MOXFIELD_AUTH_TOKEN", "").strip()
+    user_agent = os.environ.get("MOXFIELD_USER_AGENT", "").strip()
+    if not token and not user_agent:
+        raise RuntimeError(
+            "Moxfield is not configured. Set MOXFIELD_AUTH_TOKEN or a Moxfield-issued "
+            "MOXFIELD_USER_AGENT in .env."
+        )
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    return headers
+
+
+def moxfield_mainboard(deck: object) -> str:
+    if not isinstance(deck, dict):
+        return ""
+    boards = deck.get("boards")
+    if not isinstance(boards, dict):
+        return ""
+    mainboard = boards.get("mainboard") or boards.get("main")
+    if not isinstance(mainboard, dict):
+        return ""
+    cards = mainboard.get("cards")
+    if not isinstance(cards, dict):
+        return ""
+    lines: list[str] = []
+    for entry in cards.values():
+        if not isinstance(entry, dict):
+            continue
+        card = entry.get("card")
+        name = card.get("name") if isinstance(card, dict) else None
+        quantity = entry.get("quantity")
+        if isinstance(name, str) and isinstance(quantity, int) and quantity > 0:
+            lines.append(f"{quantity} {name}")
+    return "\n".join(lines)
+
+
+def moxfield_date(value: object) -> str:
+    if not isinstance(value, str):
+        return datetime.now(timezone.utc).date().isoformat()
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return datetime.now(timezone.utc).date().isoformat()
+
+
+def fetch_moxfield_archetype(
+    archetype: str,
+    days: int,
+    limit: int = MAX_ARCHETYPE_DECKS,
+    *,
+    force_refresh: bool = False,
+) -> dict:
+    """Fetch a filtered, separate community sample from Moxfield when configured."""
+    limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
+    min_views = nonnegative_int_env("MOXFIELD_MIN_VIEWS", 50)
+    min_likes = nonnegative_int_env("MOXFIELD_MIN_LIKES", 2)
+    cache_key = f"moxfield:{archetype_slug(archetype)}:{days}:{limit}:{min_views}:{min_likes}"
+    return cached_fetch(
+        cache_key,
+        ARCHETYPE_CACHE_TTL_SECONDS,
+        lambda: fetch_moxfield_archetype_live(archetype, days, limit, min_views, min_likes),
+        force_refresh=force_refresh,
+    )
+
+
+def fetch_moxfield_archetype_live(
+    archetype: str,
+    days: int,
+    limit: int,
+    min_views: int,
+    min_likes: int,
+) -> dict:
+    from urllib.parse import urlencode
+
+    query = urlencode({
+        "fmt": "pioneer",
+        "deckName": archetype,
+        "pageNumber": 1,
+        "pageSize": 100,
+        "sortType": "updated",
+        "sortDirection": "descending",
+        "showIllegal": "false",
+    })
+    search = fetch_json(f"{MOXFIELD_API_URL}/v2/decks/search?{query}", headers=moxfield_headers())
+    if not isinstance(search, dict) or not isinstance(search.get("data"), list):
+        raise RuntimeError("Moxfield returned an unexpected deck-search response")
+    cutoff = datetime.now(timezone.utc).date().fromordinal(datetime.now(timezone.utc).date().toordinal() - days)
+    candidates: list[dict] = []
+    for summary in search["data"]:
+        if not isinstance(summary, dict):
+            continue
+        if moxfield_date(summary.get("lastUpdatedAtUtc")) < cutoff.isoformat():
+            continue
+        if integer_value(summary.get("mainboardCount")) < 60:
+            continue
+        views = integer_value(summary.get("viewCount"))
+        likes = integer_value(summary.get("likeCount"))
+        if views < min_views and likes < min_likes:
+            continue
+        public_id = summary.get("publicId")
+        if not isinstance(public_id, str) or not public_id:
+            continue
+        candidates.append(summary)
+    candidates.sort(
+        key=lambda deck: (
+            integer_value(deck.get("likeCount")),
+            integer_value(deck.get("viewCount")),
+            str(deck.get("lastUpdatedAtUtc") or ""),
+        ),
+        reverse=True,
+    )
+
+    headers = moxfield_headers()
+    decks: list[dict] = []
+    for summary in candidates[:limit]:
+        public_id = summary["publicId"]
+        try:
+            full_deck = fetch_json(f"{MOXFIELD_API_URL}/v3/decks/all/{public_id}", headers=headers)
+        except RuntimeError:
+            continue
+        deck_text = moxfield_mainboard(full_deck)
+        if not deck_text:
+            continue
+        author = summary.get("createdByUser")
+        player = "Moxfield user"
+        if isinstance(author, dict):
+            player = author.get("displayName") or author.get("userName") or player
+        likes = integer_value(summary.get("likeCount"))
+        views = integer_value(summary.get("viewCount"))
+        decks.append({
+            "number": public_id,
+            "date": moxfield_date(summary.get("lastUpdatedAtUtc")),
+            "event": "Moxfield community list",
+            "result": f"Community · {likes} likes · {views} views",
+            "player": player,
+            "archetype": archetype,
+            "source": "moxfield",
+            "format": "pioneer",
+            "deck_text": deck_text,
+            "source_url": summary.get("publicUrl") or f"https://www.moxfield.com/decks/{public_id}",
+        })
+    payload = {
+        "schema_version": "1",
+        "kind": "moxfield_pioneer_archetype",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "format": "pioneer",
+        "source": "moxfield",
+        "days": days,
+        "filters": {"minimum_views": min_views, "minimum_likes": min_likes},
+        "events": [{
+            "id": f"moxfield-{archetype_slug(archetype)}",
+            "url": f"https://www.moxfield.com/decks/public?fmt=pioneer&search={archetype_slug(archetype)}",
+            "title": f"Moxfield community · {archetype}",
+            "publish_date": datetime.now(timezone.utc).date().isoformat(),
+            "event_type": "community_sample",
             "decks_total": len(decks),
             "decks_cached": len(decks),
             "decks": decks,
@@ -562,6 +748,21 @@ class DelverHandler(SimpleHTTPRequestHandler):
                 return self._send_json(400, {"error": "An archetype name is required"})
             try:
                 return self._send_json(200, fetch_mtgdecklists_archetype(
+                    archetype, days, limit, force_refresh=force_refresh
+                ))
+            except (RuntimeError, ValueError) as error:
+                return self._send_json(502, {"error": str(error)})
+        if parsed.path == "/api/community":
+            query = parse_qs(parsed.query)
+            archetype = query.get("name", [""])[0].strip()
+            days = int(query.get("days", [90])[0])
+            limit = int(query.get("limit", [MAX_ARCHETYPE_DECKS])[0])
+            force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
+            days = max(1, min(days, 90))
+            if not archetype:
+                return self._send_json(400, {"error": "An archetype name is required"})
+            try:
+                return self._send_json(200, fetch_moxfield_archetype(
                     archetype, days, limit, force_refresh=force_refresh
                 ))
             except (RuntimeError, ValueError) as error:

@@ -42,13 +42,17 @@
           <input id="recencyRange" type="range" min="7" max="90" step="1" value="90" />
         </div>
         <div class="field sample-limit-field">
-          <label for="supplementLimit">Extra-list cap</label>
-          <select id="supplementLimit" title="Maximum additional published or community lists to include">
+          <label for="supplementLimit">Per-source cap</label>
+          <select id="supplementLimit" title="Maximum additional published or community lists to request from each source">
             <option value="5">5 lists</option>
             <option value="10">10 lists</option>
             <option value="20" selected>20 lists</option>
           </select>
         </div>
+        <label class="source-toggle" for="moxfieldEnabled" title="Adds filtered Moxfield community lists separately from tournament lists">
+          <input id="moxfieldEnabled" type="checkbox" checked />
+          <span>Moxfield<br /><small>community lists</small></span>
+        </label>
         <button id="analyzeButton" class="primary-button">Analyze archetype <span>→</span></button>
         <button id="refreshData" class="refresh-button" title="Refresh the live MTGO feed">↻</button>
       </section>

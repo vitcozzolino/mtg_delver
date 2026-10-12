@@ -31,11 +31,13 @@ const sampleDatasets = {
 let datasets = {};
 const TOPDECK_FEED_URL = '/api/pioneer';
 const ARCHETYPE_FEED_URL = '/api/archetype';
+const COMMUNITY_FEED_URL = '/api/community';
 const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_Data/data-publish/data/latest/mtgo-decklists/pioneer.json';
 const selectArchetype = document.querySelector('#archetypeSelect');
 const selectDeck = document.querySelector('#deckSelect');
 const range = document.querySelector('#recencyRange');
 const supplementLimit = document.querySelector('#supplementLimit');
+const moxfieldEnabled = document.querySelector('#moxfieldEnabled');
 const $ = (selector) => document.querySelector(selector);
 const isLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
 const cardPreview = $('#cardPreview');
@@ -56,7 +58,7 @@ function setLoading(isLoading, title = 'Loading current decklists', detail = 'Co
   progress.hidden = !isLoading;
   document.body.classList.toggle('is-loading', isLoading);
   document.querySelector('.app-shell').setAttribute('aria-busy', String(isLoading));
-  [selectArchetype, selectDeck, range, supplementLimit, refresh, analyze].forEach(control => { control.disabled = isLoading; });
+  [selectArchetype, selectDeck, range, supplementLimit, moxfieldEnabled, refresh, analyze].forEach(control => { control.disabled = isLoading; });
   refresh.classList.toggle('is-spinning', isLoading);
   if (!isLoading) return;
   $('#loadingTitle').textContent = title;
@@ -119,18 +121,44 @@ async function enrichArchetype(archetype, days, { showLoading = false, forceRefr
   else $('#loadingDetail').textContent = 'Loading additional published tournament lists…';
   try {
     const refresh = forceRefresh ? '&refresh=1' : '';
-    const response = await fetch(`${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`, { cache: 'no-store' });
-    if (!response.ok) throw new Error('Supplemental archetype source was unavailable');
-    const supplementFeed = await response.json();
-    const supplemental = buildLiveDatasets(supplementFeed)[archetype];
-    if (!supplemental || token !== archetypeLoadToken || !datasets[archetype]) return;
+    const sources = [{
+      label: 'MTG Decklists',
+      url: `${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`,
+    }];
+    if (moxfieldEnabled.checked) sources.push({
+      label: 'Moxfield community',
+      url: `${COMMUNITY_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`,
+    });
+    const results = await Promise.all(sources.map(async source => {
+      const response = await fetch(source.url, { cache: 'no-store' });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(`${source.label}: ${body.error || 'source unavailable'}`);
+      }
+      return { ...source, feed: await response.json() };
+    }).map(promise => promise.catch(error => ({ error }))));
+    if (token !== archetypeLoadToken || !datasets[archetype]) return;
     const existing = new Set(datasets[archetype].decks.map(deckKey));
-    const additions = supplemental.decks.filter(deck => !existing.has(deckKey(deck)));
-    if (!additions.length) return;
-    datasets[archetype].decks.push(...additions);
+    const additionsBySource = [];
+    const sourceErrors = [];
+    results.forEach(result => {
+      if (result.error) {
+        sourceErrors.push(result.error.message);
+        return;
+      }
+      const supplemental = buildLiveDatasets(result.feed)[archetype];
+      if (!supplemental) return;
+      const additions = supplemental.decks.filter(deck => !existing.has(deckKey(deck)));
+      additions.forEach(deck => existing.add(deckKey(deck)));
+      if (!additions.length) return;
+      datasets[archetype].decks.push(...additions);
+      const cacheSuffix = result.feed.cache?.status === 'hit' ? ' (local cache)' : result.feed.cache?.status === 'stale' ? ' (stale local cache)' : '';
+      additionsBySource.push(`+${additions.length} ${result.label} lists${cacheSuffix}`);
+    });
     datasets[archetype].decks.sort((a, b) => b.date.localeCompare(a.date) || a.name.localeCompare(b.name));
-    const cacheSuffix = supplementFeed.cache?.status === 'hit' ? ' (local cache)' : supplementFeed.cache?.status === 'stale' ? ' (stale local cache)' : '';
-    datasets[archetype].note += ` · +${additions.length} additional published lists from MTG Decklists${cacheSuffix}`;
+    if (additionsBySource.length) datasets[archetype].note += ` · ${additionsBySource.join(' · ')}`;
+    const moxfieldError = sourceErrors.find(message => message.startsWith('Moxfield community:'));
+    if (moxfieldError) datasets[archetype].note += ' · Moxfield community source needs local access configured';
     if (selectArchetype.value === archetype) {
       const selected = selectDeck.value;
       updateDeckChoices();
@@ -321,6 +349,7 @@ range.addEventListener('change', () => {
   if (!$('#dataStatus').textContent.includes('public fallback')) loadLiveData();
 });
 supplementLimit.addEventListener('change', loadLiveData);
+moxfieldEnabled.addEventListener('change', loadLiveData);
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', () => loadLiveData({ forceRefresh: true }));
 $('#aboutButton').addEventListener('click', () => $('#aboutDialog').showModal());
