@@ -149,6 +149,10 @@ class DelverHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
-if __name__ == "__main__":
+def main() -> None:
     print("Delver is available at http://127.0.0.1:8080")
     ThreadingHTTPServer(("127.0.0.1", 8080), DelverHandler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

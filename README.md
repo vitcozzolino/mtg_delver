@@ -1,6 +1,6 @@
 # Delver — Pioneer Deck Explorer
 
-A no-build, static Pioneer deck explorer. Open `index.html` in a browser to use it.
+A no-build Pioneer deck explorer: a plain JavaScript frontend with a small local Python API adapter for TopDeck.
 
 ## What it does
 
@@ -21,20 +21,18 @@ The app includes a local-only TopDeck API adapter. It keeps your key on your mac
 Save the key once (the prompt is hidden and writes a gitignored `.env` file):
 
 ```bash
-python3 setup_key.py
+uv run python setup_key.py
 ```
 
 After that, starting the Python backend needs no export or key entry:
 
 ```bash
-python3 server.py
+uv run delver
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. The server asks TopDeck for Pioneer events and their published decklists; the recency slider uses 1–90 days. The UI visibly credits TopDeck when that source is active.
 
-`server.py` has no third-party dependencies. Never commit a real key; `.env.example` is only a naming reference.
-
-The source does not provide a broad historical window in this endpoint. For 30/60/90-day research, the next implementation should add a provider such as the free TopDeck API (requires the user’s API key and visible attribution) or a maintained local archive, while preserving every deck’s source URL and event metadata.
+The frontend remains plain HTML, CSS, and JavaScript. Python is only the local API server that keeps the TopDeck key out of the browser. `uv` creates an isolated `.venv` and locks the project in `uv.lock`; there are currently no third-party dependencies. Never commit a real key; `.env.example` is only a naming reference.
 
 Any importer should normalize records into this shape:
 
