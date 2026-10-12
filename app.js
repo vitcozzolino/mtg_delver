@@ -40,6 +40,8 @@ const selectDeck = document.querySelector('#deckSelect');
 const range = document.querySelector('#recencyRange');
 const supplementLimit = document.querySelector('#supplementLimit');
 const moxfieldEnabled = document.querySelector('#moxfieldEnabled');
+const savedHtmlFiles = document.querySelector('#savedHtmlFiles');
+const importSavedHtml = document.querySelector('#importSavedHtml');
 const $ = (selector) => document.querySelector(selector);
 const fallbackIsLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
 const cardPreview = $('#cardPreview');
@@ -50,6 +52,7 @@ let currentPreviewName = '';
 let loadingMessageTimer;
 const MIN_LOADING_FEEDBACK_MS = 800;
 let archetypeLoadToken = 0;
+const importedDecks = [];
 
 function profileFor(name) { return cardProfiles.get(name); }
 function isLand(name) {
@@ -122,7 +125,7 @@ function setLoading(isLoading, title = 'Loading current decklists', detail = 'Co
   progress.hidden = !isLoading;
   document.body.classList.toggle('is-loading', isLoading);
   document.querySelector('.app-shell').setAttribute('aria-busy', String(isLoading));
-  [selectArchetype, selectDeck, range, supplementLimit, moxfieldEnabled, refresh, analyze].forEach(control => { control.disabled = isLoading; });
+  [selectArchetype, selectDeck, range, supplementLimit, moxfieldEnabled, importSavedHtml, refresh, analyze].forEach(control => { control.disabled = isLoading; });
   refresh.classList.toggle('is-spinning', isLoading);
   if (!isLoading) return;
   $('#loadingTitle').textContent = title;
@@ -181,6 +184,135 @@ function buildLiveDatasets(feed) {
 }
 function deckKey(deck) {
   return `${deck.date}|${deck.player || deck.name}|${Object.entries(deck.cards).sort(([a], [b]) => a.localeCompare(b)).map(([name, quantity]) => `${quantity} ${name}`).join('|')}`;
+}
+
+function htmlFragmentText(value) {
+  const element = document.createElement('textarea');
+  element.innerHTML = value.replace(/<[^>]+>/g, ' ');
+  return element.value.replace(/\s+/g, ' ').trim();
+}
+
+function dateFromSavedPage(documentNode) {
+  const datetime = documentNode.querySelector('time[datetime]')?.getAttribute('datetime');
+  const matched = datetime?.match(/^\d{4}-\d{2}-\d{2}/)?.[0]
+    || documentNode.body.textContent.match(/\b20\d{2}-\d{2}-\d{2}\b/)?.[0];
+  return matched || new Date().toISOString().slice(0, 10);
+}
+
+function archetypeFromSavedPage(documentNode, fallbackArchetype) {
+  const listingHeading = [...documentNode.querySelectorAll('h1, h2')]
+    .map(element => element.textContent.replace(/\s+/g, ' ').trim())
+    .map(text => text.match(/^Pioneer (.+?) decklists$/i)?.[1])
+    .find(Boolean);
+  if (listingHeading) return listingHeading;
+  const archetypeLink = [...documentNode.querySelectorAll('a[href^="/Pioneer/"]')]
+    .find(link => /^\/Pioneer\/[a-z0-9-]+$/i.test(link.getAttribute('href') || ''));
+  const label = archetypeLink?.textContent.replace(/\s+/g, ' ').trim();
+  return label || fallbackArchetype;
+}
+
+function deckLinksFromSavedPage(documentNode) {
+  return [...documentNode.querySelectorAll('a[href^="/Pioneer/"]')]
+    .map(link => link.getAttribute('href'))
+    .filter(href => /-decklist-by-[^/]+$/i.test(href || ''))
+    .map(href => `https://mtgdecks.net${href}`)
+    .filter((href, index, links) => links.indexOf(href) === index);
+}
+
+function deckFromSavedMtgDecksPage(html, fileName, fallbackArchetype) {
+  const documentNode = new DOMParser().parseFromString(html, 'text/html');
+  const mainStart = html.search(/<h2[^>]*>\s*Main deck\s*<\/h2>/i);
+  const sideStart = mainStart >= 0
+    ? html.slice(mainStart).search(/<h2[^>]*>\s*Sideboard\s*<\/h2>/i)
+    : -1;
+  if (mainStart < 0 || sideStart < 0) return null;
+  const mainHtml = html.slice(mainStart, mainStart + sideStart);
+  const cards = {};
+  for (const [, quantity, rawName] of mainHtml.matchAll(/<figcaption[^>]*>\s*<span[^>]*class=["']qty["'][^>]*>(\d+)<\/span>(.*?)<\/figcaption>/gis)) {
+    const name = htmlFragmentText(rawName);
+    if (name) cards[name] = (cards[name] || 0) + Number(quantity);
+  }
+  if (Object.values(cards).reduce((total, quantity) => total + quantity, 0) < 40) return null;
+  const rawHeading = documentNode.querySelector('h1')?.textContent.replace(/\s+/g, ' ').trim();
+  const player = documentNode.body.textContent.match(/\bBy\s+([^\n|]{2,70})/)?.[1]?.replace(/\s+/g, ' ').trim();
+  const cleanFileName = fileName.replace(/\.(html?|txt)$/i, '').replace(/[-_]+/g, ' ');
+  const date = dateFromSavedPage(documentNode);
+  return {
+    archetype: archetypeFromSavedPage(documentNode, fallbackArchetype),
+    name: `${player || rawHeading || cleanFileName} — saved page`,
+    event: 'Imported saved MTGDecks page',
+    finish: 'Local import',
+    date,
+    ageDays: Math.max(0, Math.floor((Date.now() - new Date(`${date}T12:00:00Z`)) / 86400000)),
+    cards,
+    player: player || cleanFileName,
+    sourceUrl: 'https://mtgdecks.net/',
+  };
+}
+
+function mergeImportedDecks() {
+  const additions = new Map();
+  importedDecks.forEach(deck => {
+    const archetype = deck.archetype || selectArchetype.value;
+    if (!datasets[archetype]) {
+      datasets[archetype] = {
+        source: 'Local saved pages',
+        sourceUrl: 'https://mtgdecks.net/',
+        note: 'Locally imported saved MTGDecks pages',
+        decks: [],
+      };
+    }
+    const existing = new Set(datasets[archetype].decks.map(deckKey));
+    if (existing.has(deckKey(deck))) return;
+    datasets[archetype].decks.push(deck);
+    additions.set(archetype, (additions.get(archetype) || 0) + 1);
+  });
+  additions.forEach((count, archetype) => {
+    datasets[archetype].decks.sort((a, b) => b.date.localeCompare(a.date) || a.name.localeCompare(b.name));
+    datasets[archetype].note += ` · +${count} locally imported saved page${count === 1 ? '' : 's'}`;
+  });
+  return additions;
+}
+
+async function importSavedHtmlPages(files) {
+  if (!files.length) return;
+  const fallbackArchetype = selectArchetype.value || 'Imported Pioneer deck';
+  setLoading(true, 'Reading saved deck pages', 'Parsing local HTML in your browser…');
+  try {
+    const pages = await Promise.all([...files].map(async file => ({
+      name: file.name,
+      html: await file.text(),
+    })));
+    const parsedDecks = pages
+      .map(page => deckFromSavedMtgDecksPage(page.html, page.name, fallbackArchetype))
+      .filter(Boolean);
+    const linkedDecks = pages.flatMap(page => {
+      const documentNode = new DOMParser().parseFromString(page.html, 'text/html');
+      return deckLinksFromSavedPage(documentNode);
+    });
+    if (!parsedDecks.length) {
+      const uniqueLinks = [...new Set(linkedDecks)];
+      $('#localImportStatus').textContent = uniqueLinks.length
+        ? `Found ${uniqueLinks.length} deck links, but this overview page has no card lists. Save the individual deck pages, then import them together.`
+        : 'No MTGDecks mainboards found. Select individual saved deck pages (not a Cloudflare challenge or overview page).';
+      return;
+    }
+    const knownKeys = new Set(importedDecks.map(deckKey));
+    const newDecks = parsedDecks.filter(deck => !knownKeys.has(deckKey(deck)));
+    importedDecks.push(...newDecks);
+    const additions = mergeImportedDecks();
+    const preferredArchetype = newDecks[0]?.archetype || fallbackArchetype;
+    populateArchetypes(preferredArchetype);
+    try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
+    render();
+    const added = [...additions.values()].reduce((total, count) => total + count, 0);
+    $('#localImportStatus').textContent = added
+      ? `Imported ${added} local deck page${added === 1 ? '' : 's'} into ${preferredArchetype}.`
+      : 'Those saved deck pages were already part of this local session.';
+  } finally {
+    savedHtmlFiles.value = '';
+    setLoading(false);
+  }
 }
 async function enrichArchetype(archetype, days, { showLoading = false, forceRefresh = false } = {}) {
   const token = ++archetypeLoadToken;
@@ -271,6 +403,7 @@ async function loadLiveData({ forceRefresh = false } = {}) {
       feed = await response.json();
     }
     datasets = buildLiveDatasets(feed);
+    mergeImportedDecks();
     if (!Object.keys(datasets).length) throw new Error('No usable Pioneer lists returned');
     range.min = 1; range.max = 90; range.value = feed.days;
     $('#rangeOutput').textContent = `${feed.days} days`;
@@ -462,6 +595,8 @@ range.addEventListener('change', () => {
 });
 supplementLimit.addEventListener('change', loadLiveData);
 moxfieldEnabled.addEventListener('change', loadLiveData);
+importSavedHtml.addEventListener('click', () => savedHtmlFiles.click());
+savedHtmlFiles.addEventListener('change', () => importSavedHtmlPages(savedHtmlFiles.files));
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', () => loadLiveData({ forceRefresh: true }));
 $('#aboutButton').addEventListener('click', () => $('#aboutDialog').showModal());

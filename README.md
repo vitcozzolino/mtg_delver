@@ -20,6 +20,12 @@ The default backend now merges two evidence-grade sources: Videre's public MTGO 
 
 For the selected archetype, Delver also loads capped, cached supplemental lists from MTG Decklists and MTGContent's public Pioneer search. Source labels remain visible and identical decks are de-duplicated before comparison.
 
+## Import saved MTGDecks pages
+
+The **Import saved HTML** control reads saved `.html` deck pages directly in the browser. It never sends those files anywhere and does not make a request to MTGDecks. Save one or more individual decklist pages in your browser, choose them together, and they become a local-only supplement to the relevant archetype for the current session.
+
+An archetype overview page is useful for finding links, but it has no card lists to analyze; Delver will report how many deck links it found and ask for the individual saved deck pages.
+
 ## Moxfield community lists (optional)
 
 Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set this read-only identifier in your local `.env` file:

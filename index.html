@@ -56,6 +56,17 @@
         <button id="analyzeButton" class="primary-button">Analyze archetype <span>→</span></button>
         <button id="refreshData" class="refresh-button" title="Refresh the live MTGO feed">↻</button>
       </section>
+      <section class="local-import" aria-label="Local decklist import">
+        <div>
+          <p class="eyebrow">LOCAL EVIDENCE</p>
+          <p>Import saved MTGDecks deck pages from your browser. Files are read only in this browser; Delver makes no request back to MTGDecks.</p>
+        </div>
+        <div class="local-import-actions">
+          <input id="savedHtmlFiles" type="file" accept="text/html,.html,.htm" multiple hidden />
+          <button id="importSavedHtml" class="import-button" type="button">Import saved HTML</button>
+          <p id="localImportStatus" class="local-import-status" role="status" aria-live="polite">Choose one or more individual deck pages.</p>
+        </div>
+      </section>
 
       <p class="data-note" id="dataNote"></p>
 
