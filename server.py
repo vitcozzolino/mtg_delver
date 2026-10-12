@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import time
 from errno import EADDRINUSE
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,10 +28,9 @@ VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
 SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
 MTG_DECKLISTS_URL = "https://mtgdecklists.com"
 MAX_VIDERE_DECKS = 1_000
-SOURCE_CACHE_TTL_SECONDS = 300
-SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
-ARCHETYPE_CACHE_TTL_SECONDS = 1_800
-ARCHETYPE_CACHE: dict[tuple[str, int, int], tuple[float, dict]] = {}
+CACHE_DB = ROOT / "delver-cache.sqlite3"
+SOURCE_CACHE_TTL_SECONDS = 30 * 60
+ARCHETYPE_CACHE_TTL_SECONDS = 6 * 60 * 60
 MAX_ARCHETYPE_DECKS = 20
 
 
@@ -50,6 +50,77 @@ def load_local_env() -> None:
 
 
 load_local_env()
+
+
+def initialize_cache() -> None:
+    """Create a small, local cache that survives server restarts."""
+    with sqlite3.connect(CACHE_DB) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cached_payloads (
+                cache_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                fetched_at REAL NOT NULL
+            )
+            """
+        )
+
+
+def read_cached_payload(cache_key: str) -> tuple[dict | None, float | None]:
+    with sqlite3.connect(CACHE_DB, timeout=5) as connection:
+        row = connection.execute(
+            "SELECT payload, fetched_at FROM cached_payloads WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+    if not row:
+        return None, None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None, None
+    return (payload if isinstance(payload, dict) else None), float(row[1])
+
+
+def write_cached_payload(cache_key: str, payload: dict) -> float:
+    fetched_at = time.time()
+    with sqlite3.connect(CACHE_DB, timeout=5) as connection:
+        connection.execute(
+            """
+            INSERT INTO cached_payloads (cache_key, payload, fetched_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at
+            """,
+            (cache_key, json.dumps(payload), fetched_at),
+        )
+    return fetched_at
+
+
+def annotate_cache(payload: dict, status: str, fetched_at: float, detail: str | None = None) -> dict:
+    """Return a copy so cache metadata never contaminates the stored payload."""
+    response = json.loads(json.dumps(payload))
+    response["cache"] = {
+        "status": status,
+        "fetched_at": datetime.fromtimestamp(fetched_at, tz=timezone.utc).isoformat(),
+    }
+    if detail:
+        response["cache"]["detail"] = detail
+    return response
+
+
+def cached_fetch(cache_key: str, ttl_seconds: int, loader, *, force_refresh: bool = False) -> dict:
+    """Read-through SQLite cache, with stale data as a safe source-outage fallback."""
+    cached, fetched_at = read_cached_payload(cache_key)
+    if cached is not None and fetched_at is not None and not force_refresh:
+        if time.time() - fetched_at < ttl_seconds:
+            return annotate_cache(cached, "hit", fetched_at)
+    try:
+        payload = loader()
+    except RuntimeError as error:
+        if cached is not None and fetched_at is not None:
+            return annotate_cache(cached, "stale", fetched_at, f"Live refresh failed: {error}")
+        raise
+    fetched_at = write_cached_payload(cache_key, payload)
+    return annotate_cache(payload, "refreshed", fetched_at)
 
 
 def to_deck_text(deck: object) -> str:
@@ -107,17 +178,29 @@ def archetype_slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def fetch_mtgdecklists_archetype(archetype: str, days: int, limit: int = MAX_ARCHETYPE_DECKS) -> dict:
+def fetch_mtgdecklists_archetype(
+    archetype: str,
+    days: int,
+    limit: int = MAX_ARCHETYPE_DECKS,
+    *,
+    force_refresh: bool = False,
+) -> dict:
     """Fetch a small, cached public sample for one requested Pioneer archetype.
 
     MTG Decklists permits crawling in robots.txt. This deliberately loads at
-    most 20 recent pages and caches results for 30 minutes.
+    most 20 recent pages and persists results locally for six hours.
     """
     limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
-    cache_key = (archetype.lower(), days, limit)
-    cached = ARCHETYPE_CACHE.get(cache_key)
-    if cached and time.monotonic() - cached[0] < ARCHETYPE_CACHE_TTL_SECONDS:
-        return cached[1]
+    cache_key = f"archetype:{archetype_slug(archetype)}:{days}:{limit}"
+    return cached_fetch(
+        cache_key,
+        ARCHETYPE_CACHE_TTL_SECONDS,
+        lambda: fetch_mtgdecklists_archetype_live(archetype, days, limit),
+        force_refresh=force_refresh,
+    )
+
+
+def fetch_mtgdecklists_archetype_live(archetype: str, days: int, limit: int) -> dict:
 
     list_url = f"{MTG_DECKLISTS_URL}/archetypes/pioneer-{archetype_slug(archetype)}.html"
     listing = fetch_html(list_url)
@@ -206,7 +289,6 @@ def fetch_mtgdecklists_archetype(archetype: str, days: int, limit: int = MAX_ARC
             "decks": decks,
         }],
     }
-    ARCHETYPE_CACHE[cache_key] = (time.monotonic(), payload)
     return payload
 
 
@@ -335,11 +417,17 @@ def deduplicate(decks: list[dict]) -> list[dict]:
     return unique
 
 
-def fetch_pioneer_sources(days: int) -> dict:
+def fetch_pioneer_sources(days: int, *, force_refresh: bool = False) -> dict:
     """Merge evidence-grade MTGO and paper tournament lists without a single-source dependency."""
-    cached = SOURCE_CACHE.get(days)
-    if cached and time.monotonic() - cached[0] < SOURCE_CACHE_TTL_SECONDS:
-        return cached[1]
+    return cached_fetch(
+        f"pioneer:{days}",
+        SOURCE_CACHE_TTL_SECONDS,
+        lambda: fetch_pioneer_sources_live(days),
+        force_refresh=force_refresh,
+    )
+
+
+def fetch_pioneer_sources_live(days: int) -> dict:
     sources = {"Videre MTGO": fetch_videre, "Spicerack": fetch_spicerack}
     decks: list[dict] = []
     errors: list[str] = []
@@ -375,7 +463,6 @@ def fetch_pioneer_sources(days: int) -> dict:
         "warnings": errors,
         "active_sources": sorted({deck["source"] for deck in decks}),
     }
-    SOURCE_CACHE[days] = (time.monotonic(), payload)
     return payload
 
 
@@ -469,19 +556,24 @@ class DelverHandler(SimpleHTTPRequestHandler):
             archetype = query.get("name", [""])[0].strip()
             days = int(query.get("days", [90])[0])
             limit = int(query.get("limit", [MAX_ARCHETYPE_DECKS])[0])
+            force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
             days = max(1, min(days, 90))
             if not archetype:
                 return self._send_json(400, {"error": "An archetype name is required"})
             try:
-                return self._send_json(200, fetch_mtgdecklists_archetype(archetype, days, limit))
+                return self._send_json(200, fetch_mtgdecklists_archetype(
+                    archetype, days, limit, force_refresh=force_refresh
+                ))
             except (RuntimeError, ValueError) as error:
                 return self._send_json(502, {"error": str(error)})
         if parsed.path != "/api/pioneer":
             return super().do_GET()
-        days = int(parse_qs(parsed.query).get("days", [30])[0])
+        query = parse_qs(parsed.query)
+        days = int(query.get("days", [30])[0])
+        force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
         days = max(1, min(days, 90))
         try:
-            payload = fetch_pioneer_sources(days)
+            payload = fetch_pioneer_sources(days, force_refresh=force_refresh)
             self._send_json(200, payload)
         except (RuntimeError, ValueError) as error:
             self._send_json(502, {"error": str(error)})
@@ -497,6 +589,7 @@ class DelverHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    initialize_cache()
     try:
         server = ThreadingHTTPServer(("127.0.0.1", 8080), DelverHandler)
     except OSError as error:

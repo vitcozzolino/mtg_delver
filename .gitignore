@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 .venv/
 *.egg-info/
+delver-cache.sqlite3
+delver-cache.sqlite3-shm
+delver-cache.sqlite3-wal

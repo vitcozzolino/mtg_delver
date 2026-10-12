@@ -113,21 +113,24 @@ function buildLiveDatasets(feed) {
 function deckKey(deck) {
   return `${deck.date}|${deck.player || deck.name}|${Object.entries(deck.cards).sort(([a], [b]) => a.localeCompare(b)).map(([name, quantity]) => `${quantity} ${name}`).join('|')}`;
 }
-async function enrichArchetype(archetype, days, { showLoading = false } = {}) {
+async function enrichArchetype(archetype, days, { showLoading = false, forceRefresh = false } = {}) {
   const token = ++archetypeLoadToken;
   if (showLoading) setLoading(true, `Expanding ${archetype}`, 'Loading additional published tournament lists…');
   else $('#loadingDetail').textContent = 'Loading additional published tournament lists…';
   try {
-    const response = await fetch(`${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}`, { cache: 'no-store' });
+    const refresh = forceRefresh ? '&refresh=1' : '';
+    const response = await fetch(`${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}&limit=${supplementLimit.value}${refresh}`, { cache: 'no-store' });
     if (!response.ok) throw new Error('Supplemental archetype source was unavailable');
-    const supplemental = buildLiveDatasets(await response.json())[archetype];
+    const supplementFeed = await response.json();
+    const supplemental = buildLiveDatasets(supplementFeed)[archetype];
     if (!supplemental || token !== archetypeLoadToken || !datasets[archetype]) return;
     const existing = new Set(datasets[archetype].decks.map(deckKey));
     const additions = supplemental.decks.filter(deck => !existing.has(deckKey(deck)));
     if (!additions.length) return;
     datasets[archetype].decks.push(...additions);
     datasets[archetype].decks.sort((a, b) => b.date.localeCompare(a.date) || a.name.localeCompare(b.name));
-    datasets[archetype].note += ` · +${additions.length} additional published lists from MTG Decklists`;
+    const cacheSuffix = supplementFeed.cache?.status === 'hit' ? ' (local cache)' : supplementFeed.cache?.status === 'stale' ? ' (stale local cache)' : '';
+    datasets[archetype].note += ` · +${additions.length} additional published lists from MTG Decklists${cacheSuffix}`;
     if (selectArchetype.value === archetype) {
       const selected = selectDeck.value;
       updateDeckChoices();
@@ -140,7 +143,7 @@ async function enrichArchetype(archetype, days, { showLoading = false } = {}) {
     if (showLoading && token === archetypeLoadToken) setLoading(false);
   }
 }
-async function loadLiveData() {
+async function loadLiveData({ forceRefresh = false } = {}) {
   const loadingStartedAt = Date.now();
   setLoading(true, 'Refreshing Pioneer intelligence', 'Fetching recent MTGO and tournament decklists…');
   $('#dataStatus').innerHTML = '<span class="status-dot is-loading"></span> Updating Pioneer data…';
@@ -150,7 +153,8 @@ async function loadLiveData() {
     let sourceUrl = PUBLIC_FEED_URL;
     let fallbackReason = '';
     try {
-      const response = await fetch(`${TOPDECK_FEED_URL}?days=${range.value}`, { cache: 'no-store' });
+      const refresh = forceRefresh ? '&refresh=1' : '';
+      const response = await fetch(`${TOPDECK_FEED_URL}?days=${range.value}${refresh}`, { cache: 'no-store' });
       if (!response.ok) throw new Error('TopDeck is not configured');
       feed = await response.json();
       if (feed.source === 'videre-spicerack') {
@@ -172,10 +176,11 @@ async function loadLiveData() {
     range.min = 1; range.max = 90; range.value = feed.days;
     $('#rangeOutput').textContent = `${feed.days} days`;
     const sourceWarnings = Array.isArray(feed.warnings) && feed.warnings.length ? ` · Source warnings: ${feed.warnings.join(' | ')}` : '';
-    Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
-    $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}`;
+    const cacheNote = feed.cache?.status === 'hit' ? ' · served from local cache' : feed.cache?.status === 'stale' ? ' · showing stale local cache (source refresh failed)' : '';
+    Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${cacheNote}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
+    $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}${feed.cache?.status === 'hit' ? ' · cached' : ''}`;
     populateArchetypes('Izzet Phoenix');
-    await enrichArchetype(selectArchetype.value, Number(range.value));
+    await enrichArchetype(selectArchetype.value, Number(range.value), { forceRefresh });
     render();
   } catch (error) {
     $('#dataStatus').innerHTML = '<span class="status-dot"></span> Pioneer · feed unavailable';
@@ -317,7 +322,7 @@ range.addEventListener('change', () => {
 });
 supplementLimit.addEventListener('change', loadLiveData);
 $('#analyzeButton').addEventListener('click', render);
-$('#refreshData').addEventListener('click', loadLiveData);
+$('#refreshData').addEventListener('click', () => loadLiveData({ forceRefresh: true }));
 $('#aboutButton').addEventListener('click', () => $('#aboutDialog').showModal());
 $('#closeAbout').addEventListener('click', () => $('#aboutDialog').close());
 loadLiveData();
