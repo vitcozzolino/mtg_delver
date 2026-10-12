@@ -13,6 +13,7 @@ import time
 from errno import EADDRINUSE
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from html import unescape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -24,9 +25,13 @@ ROOT = Path(__file__).parent
 TOPDECK_URL = "https://topdeck.gg/api/v2/tournaments"
 VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
 SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
+MTG_DECKLISTS_URL = "https://mtgdecklists.com"
 MAX_VIDERE_DECKS = 1_000
 SOURCE_CACHE_TTL_SECONDS = 300
 SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
+ARCHETYPE_CACHE_TTL_SECONDS = 1_800
+ARCHETYPE_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
+MAX_ARCHETYPE_DECKS = 20
 
 
 def load_local_env() -> None:
@@ -78,6 +83,130 @@ def fetch_json(url: str, timeout: int = 20) -> object:
         raise RuntimeError(f"Source returned HTTP {error.code}: {detail}") from error
     except URLError as error:
         raise RuntimeError(f"Could not reach source: {error.reason}") from error
+
+
+def fetch_html(url: str, timeout: int = 20) -> str:
+    request = Request(url, headers={
+        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "mtg-delver/0.1 (+https://github.com/vitcozzolino/mtg_delver)",
+    })
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except HTTPError as error:
+        raise RuntimeError(f"Source returned HTTP {error.code}") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach source: {error.reason}") from error
+
+
+def html_text(value: str) -> str:
+    return unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def archetype_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def fetch_mtgdecklists_archetype(archetype: str, days: int) -> dict:
+    """Fetch a small, cached public sample for one requested Pioneer archetype.
+
+    MTG Decklists permits crawling in robots.txt. This deliberately loads at
+    most 20 recent pages and caches results for 30 minutes.
+    """
+    cache_key = (archetype.lower(), days)
+    cached = ARCHETYPE_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < ARCHETYPE_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    list_url = f"{MTG_DECKLISTS_URL}/archetypes/pioneer-{archetype_slug(archetype)}.html"
+    listing = fetch_html(list_url)
+    entries = []
+    pattern = re.compile(
+        r'<a class="recent-item" href="(?P<href>[^"]+)"[^>]*>.*?'
+        r'<div class="meta muted">(?P<meta>.*?)</div>.*?'
+        r'<div class="when">(?P<date>[^<]+)</div>\s*</a>',
+        re.DOTALL,
+    )
+    cutoff = datetime.now(timezone.utc).date().fromordinal(datetime.now(timezone.utc).date().toordinal() - days)
+    for match in pattern.finditer(listing):
+        try:
+            deck_date = datetime.fromisoformat(match.group("date").strip()).date()
+        except ValueError:
+            continue
+        if deck_date < cutoff:
+            continue
+        parts = [part.strip() for part in html_text(match.group("meta")).split(" · ")]
+        if len(parts) < 3:
+            continue
+        entries.append({
+            "url": f"{MTG_DECKLISTS_URL}{match.group('href')}",
+            "date": deck_date.isoformat(),
+            "player": parts[0],
+            "result": parts[1],
+            "event": " · ".join(parts[2:]),
+        })
+        if len(entries) >= MAX_ARCHETYPE_DECKS:
+            break
+
+    def load_deck(entry: dict) -> dict | None:
+        page = fetch_html(entry["url"])
+        main_match = re.search(
+            r'<div class="section-title"[^>]*><h2>Main deck</h2></div>(?P<main>.*?)'
+            r'<div class="section-title"[^>]*><h2>Sideboard</h2></div>',
+            page,
+            re.DOTALL,
+        )
+        if not main_match:
+            return None
+        cards = re.findall(
+            r'<figcaption><span class="qty">(\d+)</span>(.*?)</figcaption>',
+            main_match.group("main"),
+            re.DOTALL,
+        )
+        deck_text = "\n".join(f"{quantity} {html_text(name)}" for quantity, name in cards)
+        if not deck_text:
+            return None
+        return {
+            **entry,
+            "archetype": archetype,
+            "source": "mtgdecklists",
+            "format": "pioneer",
+            "deck_text": deck_text,
+        }
+
+    decks: list[dict] = []
+    # Keep this deliberately serial: the public source rate-limits bursts of
+    # individual deck-page requests, and one archetype fetch is cacheable.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = [executor.submit(load_deck, entry) for entry in entries]
+        for future in as_completed(futures):
+            try:
+                deck = future.result()
+            except RuntimeError:
+                continue
+            if deck:
+                decks.append(deck)
+    decks.sort(key=lambda deck: (deck["date"], deck["player"]), reverse=True)
+    payload = {
+        "schema_version": "1",
+        "kind": "mtgdecklists_pioneer_archetype",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "format": "pioneer",
+        "source": "mtgdecklists",
+        "days": days,
+        "events": [{
+            "id": f"mtgdecklists-{archetype_slug(archetype)}",
+            "url": list_url,
+            "title": f"MTG Decklists · {archetype}",
+            "publish_date": datetime.now(timezone.utc).date().isoformat(),
+            "event_type": "archetype_sample",
+            "decks_total": len(decks),
+            "decks_cached": len(decks),
+            "decks": decks,
+        }],
+    }
+    ARCHETYPE_CACHE[cache_key] = (time.monotonic(), payload)
+    return payload
 
 
 def videre_mainboard(lines: object) -> str:
@@ -334,6 +463,17 @@ class DelverHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/archetype":
+            query = parse_qs(parsed.query)
+            archetype = query.get("name", [""])[0].strip()
+            days = int(query.get("days", [90])[0])
+            days = max(1, min(days, 90))
+            if not archetype:
+                return self._send_json(400, {"error": "An archetype name is required"})
+            try:
+                return self._send_json(200, fetch_mtgdecklists_archetype(archetype, days))
+            except (RuntimeError, ValueError) as error:
+                return self._send_json(502, {"error": str(error)})
         if parsed.path != "/api/pioneer":
             return super().do_GET()
         days = int(parse_qs(parsed.query).get("days", [30])[0])

@@ -30,6 +30,7 @@ const sampleDatasets = {
 
 let datasets = {};
 const TOPDECK_FEED_URL = '/api/pioneer';
+const ARCHETYPE_FEED_URL = '/api/archetype';
 const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_Data/data-publish/data/latest/mtgo-decklists/pioneer.json';
 const selectArchetype = document.querySelector('#archetypeSelect');
 const selectDeck = document.querySelector('#deckSelect');
@@ -42,6 +43,7 @@ let previewTimer;
 let currentPreviewName = '';
 let loadingMessageTimer;
 const MIN_LOADING_FEEDBACK_MS = 800;
+let archetypeLoadToken = 0;
 
 function setLoading(isLoading, title = 'Loading current decklists', detail = 'Connecting to the tournament sources…') {
   const overlay = $('#loadingOverlay');
@@ -107,6 +109,36 @@ function buildLiveDatasets(feed) {
       return [archetype, data];
     }));
 }
+function deckKey(deck) {
+  return `${deck.date}|${deck.player || deck.name}|${Object.entries(deck.cards).sort(([a], [b]) => a.localeCompare(b)).map(([name, quantity]) => `${quantity} ${name}`).join('|')}`;
+}
+async function enrichArchetype(archetype, days, { showLoading = false } = {}) {
+  const token = ++archetypeLoadToken;
+  if (showLoading) setLoading(true, `Expanding ${archetype}`, 'Loading additional published tournament lists…');
+  else $('#loadingDetail').textContent = 'Loading additional published tournament lists…';
+  try {
+    const response = await fetch(`${ARCHETYPE_FEED_URL}?name=${encodeURIComponent(archetype)}&days=${days}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error('Supplemental archetype source was unavailable');
+    const supplemental = buildLiveDatasets(await response.json())[archetype];
+    if (!supplemental || token !== archetypeLoadToken || !datasets[archetype]) return;
+    const existing = new Set(datasets[archetype].decks.map(deckKey));
+    const additions = supplemental.decks.filter(deck => !existing.has(deckKey(deck)));
+    if (!additions.length) return;
+    datasets[archetype].decks.push(...additions);
+    datasets[archetype].decks.sort((a, b) => b.date.localeCompare(a.date) || a.name.localeCompare(b.name));
+    datasets[archetype].note += ` · +${additions.length} additional published lists from MTG Decklists`;
+    if (selectArchetype.value === archetype) {
+      const selected = selectDeck.value;
+      updateDeckChoices();
+      selectDeck.value = selected;
+      render();
+    }
+  } catch (error) {
+    console.warn(error.message);
+  } finally {
+    if (showLoading && token === archetypeLoadToken) setLoading(false);
+  }
+}
 async function loadLiveData() {
   const loadingStartedAt = Date.now();
   setLoading(true, 'Refreshing Pioneer intelligence', 'Fetching recent MTGO and tournament decklists…');
@@ -142,6 +174,7 @@ async function loadLiveData() {
     Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
     $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}`;
     populateArchetypes('Izzet Phoenix');
+    await enrichArchetype(selectArchetype.value, Number(range.value));
     render();
   } catch (error) {
     $('#dataStatus').innerHTML = '<span class="status-dot"></span> Pioneer · feed unavailable';
@@ -271,7 +304,11 @@ function renderExperiments(analysis) {
   if (!candidates.length) target.innerHTML = '<p class="package-info">No new packages are present in the sample. Add more source lists to broaden the search.</p>';
 }
 function render() { const analysis = getAnalysis(); renderDeck(analysis); renderAnalysis(analysis); renderExperiments(analysis); bindCardPreviews(); }
-selectArchetype.addEventListener('change', () => { updateDeckChoices(); render(); });
+selectArchetype.addEventListener('change', async () => {
+  updateDeckChoices();
+  render();
+  await enrichArchetype(selectArchetype.value, Number(range.value), { showLoading: true });
+});
 selectDeck.addEventListener('change', render);
 range.addEventListener('input', () => { $('#rangeOutput').textContent = `${range.value} days`; render(); });
 range.addEventListener('change', () => {
