@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +21,11 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).parent
 TOPDECK_URL = "https://topdeck.gg/api/v2/tournaments"
+VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
+SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
+MAX_VIDERE_DECKS = 1_000
+SOURCE_CACHE_TTL_SECONDS = 300
+SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
 
 
 def load_local_env() -> None:
@@ -54,6 +62,190 @@ def iso_date(unix_seconds: object) -> str:
         return datetime.fromtimestamp(float(unix_seconds), tz=timezone.utc).date().isoformat()
     except (TypeError, ValueError, OSError):
         return datetime.now(timezone.utc).date().isoformat()
+
+
+def fetch_json(url: str, timeout: int = 20) -> object:
+    request = Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "mtg-delver/0.1 (+https://github.com/vitcozzolino/mtg_delver)",
+    })
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:200]
+        raise RuntimeError(f"Source returned HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach source: {error.reason}") from error
+
+
+def videre_mainboard(lines: object) -> str:
+    if not isinstance(lines, list):
+        return ""
+    cards: list[str] = []
+    pattern = re.compile(r'^\(\d+,(?:"([^"]+)"|([^,]+)),(\d+)\)$')
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        match = pattern.match(line)
+        if not match:
+            continue
+        name = (match.group(1) or match.group(2)).strip()
+        cards.append(f"{match.group(3)} {name}")
+    return "\n".join(cards)
+
+
+def fetch_videre(days: int) -> list[dict]:
+    """Fetch a bounded, paginated Pioneer MTGO sample from Videre's public API."""
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date.fromordinal(end_date.toordinal() - days)
+    decks: list[dict] = []
+    offset = 0
+    limit = 200
+    while len(decks) < MAX_VIDERE_DECKS:
+        url = (
+            f"{VIDERE_DECKS_URL}?format=pioneer&min_date={start_date.isoformat()}"
+            f"&max_date={end_date.isoformat()}&limit={limit}&offset={offset}"
+        )
+        payload = fetch_json(url, timeout=25)
+        if not isinstance(payload, dict):
+            break
+        rows = payload.get("data", [])
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            deck_text = videre_mainboard(row.get("mainboard"))
+            if not deck_text:
+                continue
+            event_date = str(row.get("date", ""))[:10]
+            decks.append({
+                "number": str(row.get("id", "")),
+                "date": event_date,
+                "event": row.get("event_name") or "Magic Online event",
+                "result": row.get("event_type") or "Published MTGO list",
+                "player": row.get("player") or "Unknown player",
+                "archetype": row.get("archetype") or row.get("deck_name") or "Unknown",
+                "source": "videre",
+                "format": "pioneer",
+                "deck_text": deck_text,
+                "source_url": "https://www.videreproject.com/",
+            })
+            if len(decks) >= MAX_VIDERE_DECKS:
+                break
+        meta = payload.get("meta", {})
+        if not isinstance(meta, dict) or not meta.get("has_more"):
+            break
+        next_offset = meta.get("next_offset")
+        if not isinstance(next_offset, int) or next_offset <= offset:
+            break
+        offset = next_offset
+    return decks
+
+
+def infer_archetype(deck_text: str) -> str:
+    """Only infer labels for distinctive shells; otherwise keep the list unclassified."""
+    cards = deck_text.lower()
+    if "arclight phoenix" in cards:
+        return "Izzet Phoenix"
+    if "nykthos, shrine to nyx" in cards and "kiora, behemoth beckoner" in cards:
+        return "Mono-Green Devotion"
+    if "greasefang, okiba boss" in cards and "parhelion ii" in cards:
+        return "Greasefang"
+    if "lotus field" in cards and "hidden strings" in cards:
+        return "Lotus Field"
+    return "Unknown"
+
+
+def fetch_spicerack(days: int) -> list[dict]:
+    """Fetch public Pioneer tournaments; a slow/unavailable response is non-fatal."""
+    url = f"{SPICERACK_URL}?num_days={days}&event_format=PIONEER&decklist_as_text=true"
+    payload = fetch_json(url, timeout=15)
+    if not isinstance(payload, list):
+        return []
+    decks: list[dict] = []
+    for tournament in payload:
+        if not isinstance(tournament, dict):
+            continue
+        event_date = iso_date(tournament.get("startDate"))
+        for standing, row in enumerate(tournament.get("standings", []), start=1):
+            if not isinstance(row, dict):
+                continue
+            deck_text = row.get("decklist_text")
+            if not isinstance(deck_text, str) or not deck_text.strip():
+                continue
+            wins = (row.get("winsSwiss", 0) or 0) + (row.get("winsBracket", 0) or 0)
+            losses = (row.get("lossesSwiss", 0) or 0) + (row.get("lossesBracket", 0) or 0)
+            decks.append({
+                "number": f"{tournament.get('TID', '')}-{standing}",
+                "date": event_date,
+                "event": tournament.get("tournamentName") or "Spicerack tournament",
+                "result": f"#{standing} · {wins}-{losses}",
+                "player": row.get("name") or "Unknown player",
+                "archetype": row.get("archetype") or infer_archetype(deck_text),
+                "source": "spicerack",
+                "format": "pioneer",
+                "deck_text": deck_text,
+                "source_url": tournament.get("bracketUrl") or "https://www.spicerack.gg/",
+            })
+    return decks
+
+
+def deduplicate(decks: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for deck in decks:
+        fingerprint = "\n".join(sorted(line.strip().lower() for line in deck["deck_text"].splitlines() if line.strip()))
+        if not fingerprint or fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(deck)
+    return unique
+
+
+def fetch_pioneer_sources(days: int) -> dict:
+    """Merge evidence-grade MTGO and paper tournament lists without a single-source dependency."""
+    cached = SOURCE_CACHE.get(days)
+    if cached and time.monotonic() - cached[0] < SOURCE_CACHE_TTL_SECONDS:
+        return cached[1]
+    sources = {"Videre MTGO": fetch_videre, "Spicerack": fetch_spicerack}
+    decks: list[dict] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+        futures = {executor.submit(loader, days): name for name, loader in sources.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                decks.extend(future.result())
+            except RuntimeError as error:
+                errors.append(f"{name}: {error}")
+    decks = deduplicate(decks)
+    if not decks:
+        raise RuntimeError("; ".join(errors) or "No Pioneer tournament decklists returned")
+    events = [{
+        "id": "pioneer-evidence-sample",
+        "url": "https://www.videreproject.com/",
+        "title": "Pioneer tournament sample",
+        "publish_date": datetime.now(timezone.utc).date().isoformat(),
+        "event_type": "multi-source",
+        "decks_total": len(decks),
+        "decks_cached": len(decks),
+        "decks": decks,
+    }]
+    payload = {
+        "schema_version": "1",
+        "kind": "pioneer_multi_source_decklists",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "format": "pioneer",
+        "source": "videre-spicerack",
+        "days": days,
+        "events": events,
+        "warnings": errors,
+        "active_sources": sorted({deck["source"] for deck in decks}),
+    }
+    SOURCE_CACHE[days] = (time.monotonic(), payload)
+    return payload
 
 
 def fetch_topdeck(days: int) -> dict:
@@ -146,7 +338,7 @@ class DelverHandler(SimpleHTTPRequestHandler):
         days = int(parse_qs(parsed.query).get("days", [30])[0])
         days = max(1, min(days, 90))
         try:
-            payload = fetch_topdeck(days)
+            payload = fetch_pioneer_sources(days)
             self._send_json(200, payload)
         except (RuntimeError, ValueError) as error:
             self._send_json(502, {"error": str(error)})

@@ -95,8 +95,14 @@ async function loadLiveData() {
       const response = await fetch(`${TOPDECK_FEED_URL}?days=${range.value}`, { cache: 'no-store' });
       if (!response.ok) throw new Error('TopDeck is not configured');
       feed = await response.json();
-      sourceName = 'TopDeck.gg API';
-      sourceUrl = 'https://topdeck.gg';
+      if (feed.source === 'videre-spicerack') {
+        const activeSources = new Set(feed.active_sources || []);
+        sourceName = activeSources.has('spicerack') ? 'Videre MTGO + Spicerack' : 'Videre MTGO';
+        sourceUrl = 'https://www.videreproject.com/';
+      } else {
+        sourceName = 'TopDeck.gg API';
+        sourceUrl = 'https://topdeck.gg';
+      }
     } catch (error) {
       fallbackReason = error.message || 'TopDeck was unavailable';
       const response = await fetch(PUBLIC_FEED_URL, { cache: 'no-store' });
@@ -107,7 +113,8 @@ async function loadLiveData() {
     if (!Object.keys(datasets).length) throw new Error('No usable Pioneer lists returned');
     range.min = 1; range.max = sourceName === 'TopDeck.gg API' ? 90 : feed.days; range.value = feed.days;
     $('#rangeOutput').textContent = `${feed.days} days`;
-    Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}`; });
+    const sourceWarnings = Array.isArray(feed.warnings) && feed.warnings.length ? ` · Source warnings: ${feed.warnings.join(' | ')}` : '';
+    Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
     $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}`;
     populateArchetypes('Izzet Phoenix');
     render();
@@ -241,7 +248,7 @@ selectArchetype.addEventListener('change', () => { updateDeckChoices(); render()
 selectDeck.addEventListener('change', render);
 range.addEventListener('input', () => { $('#rangeOutput').textContent = `${range.value} days`; render(); });
 range.addEventListener('change', () => {
-  if ($('#dataStatus').textContent.includes('TopDeck.gg API')) loadLiveData();
+  if (!$('#dataStatus').textContent.includes('public fallback')) loadLiveData();
 });
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', loadLiveData);
