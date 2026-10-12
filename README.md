@@ -27,7 +27,7 @@ uv run python setup_key.py
 After that, starting the Python backend needs no export or key entry:
 
 ```bash
-uv run delver
+uv run python server.py
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. The server asks TopDeck for Pioneer events and their published decklists; the recency slider uses 1–90 days. The UI visibly credits TopDeck when that source is active.
