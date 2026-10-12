@@ -29,6 +29,7 @@ VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
 SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
 MTG_DECKLISTS_URL = "https://mtgdecklists.com"
 MTGCONTENT_DECKLISTS_URL = "https://www.mtgcontent.com/decklists/browse"
+MTG_TOP8_URL = "https://www.mtgtop8.com"
 MOXFIELD_API_URL = "https://api2.moxfield.com"
 MAX_VIDERE_DECKS = 1_000
 CACHE_DB = ROOT / "delver-cache.sqlite3"
@@ -36,7 +37,21 @@ SOURCE_CACHE_TTL_SECONDS = 30 * 60
 ARCHETYPE_CACHE_TTL_SECONDS = 6 * 60 * 60
 CARD_PROFILE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_ARCHETYPE_DECKS = 20
-LOCAL_DECK_ARCHIVE = ROOT / "decklists.zip"
+LOCAL_DECK_ARCHIVE = ROOT / "output" / "mtgdecks" / "decklists.zip"
+# MTGTop8 does not publish an API or rate-limit guidance. Keep every live
+# lookup intentionally small, serial, and cache-first.
+MTG_TOP8_REQUEST_DELAY_SECONDS = 0.75
+
+
+# MTGTop8's public labels do not always match the labels used by MTGO sources.
+# Keep aliases narrow: an ambiguous match is safer than silently mixing shells.
+MTG_TOP8_ARCHETYPE_ALIASES = {
+    "izzet phoenix": ("arclight phoenix", "izzet phoenix", "izzet arclight"),
+    "azorius control": ("azorius control", "uw control", "blue white control"),
+    "mono green devotion": ("mono green devotion", "green devotion"),
+    "greasefang": ("greasefang",),
+    "lotus field": ("lotus field",),
+}
 
 
 def load_local_env() -> None:
@@ -238,7 +253,7 @@ def fetch_local_phoenix_archive() -> dict:
     fetched from MTGDecks and it is marked historical in the returned payload.
     """
     if not LOCAL_DECK_ARCHIVE.is_file():
-        raise RuntimeError("Local deck archive not found. Add decklists.zip beside server.py.")
+        raise RuntimeError("Local deck archive not found. Run the MTGDecks loader to create output/mtgdecks/decklists.zip.")
     decks: list[dict] = []
     with zipfile.ZipFile(LOCAL_DECK_ARCHIVE) as archive:
         for info in archive.infolist():
@@ -591,6 +606,190 @@ def fetch_mtgcontent_archetype_live(archetype: str, days: int, limit: int) -> di
             "decks": decks,
         }],
     }
+
+
+def mtgtop8_date(value: str) -> str | None:
+    """Convert MTGTop8's DD/MM/YY list date into the common ISO format."""
+    try:
+        return datetime.strptime(value.strip(), "%d/%m/%y").date().isoformat()
+    except ValueError:
+        return None
+
+
+def mtgtop8_meta_window(page: str, days: int) -> str:
+    """Find the current MTGTop8 meta id closest to the requested date window."""
+    windows: dict[str, str] = {}
+    for match in re.finditer(
+        r'href=["\']?\?f=PI&meta=(?P<meta>\d+)&a=["\']?[^>]*>'
+        r'(?P<label>.*?)</a>',
+        page,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        label = html_text(match.group("label")).casefold()
+        windows[label] = match.group("meta")
+    current_year_meta = next(
+        (meta_id for label, meta_id in windows.items() if re.fullmatch(r"all \d{4} decks", label)),
+        None,
+    )
+    if days > 62 and current_year_meta:
+        return current_year_meta
+    preferred_labels = (
+        ("last 2 weeks", "last 2 months", "all pioneer decks")
+        if days <= 14
+        else ("last 2 months", "all pioneer decks")
+        if days <= 62
+        else ("all pioneer decks", "last 2 months")
+    )
+    for label in preferred_labels:
+        if label in windows:
+            return windows[label]
+    if current_year_meta:
+        return current_year_meta
+    if not windows:
+        raise RuntimeError("MTGTop8's Pioneer meta windows could not be read")
+    return next(iter(windows.values()))
+
+
+def mtgtop8_archetype_id(page: str, archetype: str) -> str:
+    """Resolve a local archetype label to MTGTop8's public numeric id."""
+    aliases = MTG_TOP8_ARCHETYPE_ALIASES.get(archetype.casefold(), (archetype,))
+    candidates: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r'href=["\']?archetype\?a=(?P<id>\d+)&meta=(?P<meta>\d+)&f=PI["\']?[^>]*>'
+        r'(?P<label>.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(page):
+        candidates.append((html_text(match.group("label")), match.group("id")))
+    for alias in aliases:
+        alias_key = alias.casefold()
+        for label, identifier in candidates:
+            if label.casefold() == alias_key:
+                return identifier
+    if not candidates:
+        raise RuntimeError("MTGTop8 has no Pioneer archetype index for the selected window")
+    raise RuntimeError(f"MTGTop8 has no unambiguous match for {archetype}")
+
+
+def parse_mtgtop8_entries(page: str, cutoff: str, limit: int) -> list[dict]:
+    """Extract ranked public deck links from one MTGTop8 archetype page."""
+    entries: list[dict] = []
+    for row in re.findall(r"<tr[^>]*class=[\"']?hover_tr[^>]*>(.*?)</tr>", page, re.IGNORECASE | re.DOTALL):
+        deck_match = re.search(
+            r'href=["\']?(?P<href>/event\?e=(?P<event_id>\d+)&d=(?P<deck_id>\d+)&f=PI)["\']?'
+            r'[^>]*>(?P<name>.*?)</a>',
+            row,
+            re.IGNORECASE | re.DOTALL,
+        )
+        columns = [html_text(column) for column in re.findall(r"<td[^>]*>(.*?)</td>", row, re.IGNORECASE | re.DOTALL)]
+        if not deck_match or len(columns) < 7:
+            continue
+        deck_date = mtgtop8_date(columns[-1])
+        if not deck_date or deck_date < cutoff:
+            continue
+        entries.append({
+            "number": deck_match.group("deck_id"),
+            "date": deck_date,
+            "event": columns[3] or "MTGTop8 event",
+            "result": f"#{columns[-2] or 'published'}",
+            "player": columns[2] or "Unknown player",
+            "title": html_text(deck_match.group("name")) or "Published deck",
+            "source_url": f"{MTG_TOP8_URL}{deck_match.group('href')}",
+        })
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def mtgtop8_mainboard(page: str) -> str:
+    """Read only main-deck card rows; MTGTop8 marks those rows with an md id."""
+    lines: list[str] = []
+    pattern = re.compile(
+        r'<div\s+id=["\']?md[^>]*class=["\'][^"\']*deck_line[^"\']*["\'][^>]*>'
+        r'\s*(?P<quantity>\d+)\s*<span[^>]*>(?P<name>.*?)</span>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(page):
+        name = html_text(match.group("name"))
+        quantity = int(match.group("quantity"))
+        if name and quantity > 0:
+            lines.append(f"{quantity} {name}")
+    total = sum(int(line.split(" ", 1)[0]) for line in lines)
+    return "\n".join(lines) if 40 <= total <= 100 else ""
+
+
+def fetch_mtgtop8_archetype(
+    archetype: str,
+    days: int,
+    limit: int = MAX_ARCHETYPE_DECKS,
+    *,
+    force_refresh: bool = False,
+) -> dict:
+    """Fetch a small, cached Pioneer sample from MTGTop8's public pages."""
+    limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
+    cache_key = f"mtgtop8:{archetype_slug(archetype)}:{days}:{limit}"
+    return cached_fetch(
+        cache_key,
+        ARCHETYPE_CACHE_TTL_SECONDS,
+        lambda: fetch_mtgtop8_archetype_live(archetype, days, limit),
+        force_refresh=force_refresh,
+    )
+
+
+def fetch_mtgtop8_archetype_live(archetype: str, days: int, limit: int) -> dict:
+    """Serial, capped MTGTop8 lookup: index, one archetype page, then deck pages."""
+    pioneer_index_url = f"{MTG_TOP8_URL}/format?f=PI"
+    pioneer_index = fetch_html(pioneer_index_url)
+    meta_id = mtgtop8_meta_window(pioneer_index, days)
+    current_meta_id = mtgtop8_meta_window(pioneer_index, 14)
+    archetype_index = pioneer_index
+    if meta_id != current_meta_id:
+        # An archetype that was quiet this fortnight may still have useful
+        # lists in the requested two-month/current-year window.
+        archetype_index = fetch_html(f"{pioneer_index_url}&meta={meta_id}")
+    archetype_id = mtgtop8_archetype_id(archetype_index, archetype)
+    list_url = f"{MTG_TOP8_URL}/archetype?a={archetype_id}&meta={meta_id}&f=PI"
+    cutoff = datetime.now(timezone.utc).date().fromordinal(
+        datetime.now(timezone.utc).date().toordinal() - days
+    ).isoformat()
+    entries = parse_mtgtop8_entries(fetch_html(list_url), cutoff, limit)
+    decks: list[dict] = []
+    for entry in entries:
+        # MTGTop8 is a public HTML source rather than an API. Do not burst
+        # requests: one selected archetype, one request at a time, then cache.
+        time.sleep(MTG_TOP8_REQUEST_DELAY_SECONDS)
+        try:
+            deck_text = mtgtop8_mainboard(fetch_html(entry["source_url"]))
+        except RuntimeError:
+            continue
+        if not deck_text:
+            continue
+        decks.append({
+            **entry,
+            "archetype": archetype,
+            "source": "mtgtop8",
+            "format": "pioneer",
+            "deck_text": deck_text,
+        })
+    payload = {
+        "schema_version": "1",
+        "kind": "mtgtop8_pioneer_archetype",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "format": "pioneer",
+        "source": "mtgtop8",
+        "days": days,
+        "events": [{
+            "id": f"mtgtop8-{archetype_slug(archetype)}-{meta_id}",
+            "url": list_url,
+            "title": f"MTGTop8 · {archetype}",
+            "publish_date": datetime.now(timezone.utc).date().isoformat(),
+            "event_type": "archetype_sample",
+            "decks_total": len(decks),
+            "decks_cached": len(decks),
+            "decks": decks,
+        }],
+    }
+    return payload
 
 
 def nonnegative_int_env(name: str, default: int) -> int:
@@ -1076,6 +1275,21 @@ class DelverHandler(SimpleHTTPRequestHandler):
                 return self._send_json(400, {"error": "An archetype name is required"})
             try:
                 return self._send_json(200, fetch_mtgcontent_archetype(
+                    archetype, days, limit, force_refresh=force_refresh
+                ))
+            except (RuntimeError, ValueError) as error:
+                return self._send_json(502, {"error": str(error)})
+        if parsed.path == "/api/mtgtop8":
+            query = parse_qs(parsed.query)
+            archetype = query.get("name", [""])[0].strip()
+            days = int(query.get("days", [90])[0])
+            limit = int(query.get("limit", [MAX_ARCHETYPE_DECKS])[0])
+            force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
+            days = max(1, min(days, 90))
+            if not archetype:
+                return self._send_json(400, {"error": "An archetype name is required"})
+            try:
+                return self._send_json(200, fetch_mtgtop8_archetype(
                     archetype, days, limit, force_refresh=force_refresh
                 ))
             except (RuntimeError, ValueError) as error:

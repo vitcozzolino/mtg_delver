@@ -12,9 +12,11 @@ from urllib.parse import urljoin, urlparse
 
 URL = "https://mtgdecks.net/Pioneer/izzet-phoenix/min_ranking:1/platform:tabletop/deck_type:BO3"
 
-DOWNLOAD_DIR = Path("decklists")
-ZIP_PATH = Path("decklists.zip")
-STATE_PATH = Path("progress.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = PROJECT_ROOT / "output" / "mtgdecks"
+DOWNLOAD_DIR = OUTPUT_DIR / "decklists"
+ZIP_PATH = OUTPUT_DIR / "decklists.zip"
+STATE_PATH = OUTPUT_DIR / "progress.json"
 
 KEYWORD = "arclight phoenix"
 
@@ -22,7 +24,7 @@ MIN_DELAY = 3.0
 MAX_DELAY = 120.0
 MAX_RETRIES = 5
 
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 session = requests.Session()
 delay = MIN_DELAY

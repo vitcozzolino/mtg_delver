@@ -7,8 +7,6 @@ __pycache__/
 *.egg-info/
 delver-cache.sqlite3
 decklinks.txt
-decklists.zip
-decklists/
-progress.json
+output/
 delver-cache.sqlite3-shm
 delver-cache.sqlite3-wal

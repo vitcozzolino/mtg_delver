@@ -4,10 +4,16 @@ version = "0.1.0"
 description = "A Pioneer Magic: The Gathering deck explorer"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "playwright>=1.63.0",
+    "requests>=2.34.2",
+]
 
 [project.scripts]
 delver = "server:main"
+load-mtgdecks = "loaders.runner:mtgdecks"
+load-aetherhub = "loaders.runner:aetherhub"
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -15,3 +21,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["server"]
+packages = ["loaders"]
