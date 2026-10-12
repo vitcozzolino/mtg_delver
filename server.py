@@ -311,20 +311,13 @@ def integer_value(value: object) -> int:
 
 
 def moxfield_headers() -> dict[str, str]:
-    """Return optional Moxfield credentials without exposing them to the browser."""
-    token = os.environ.get("MOXFIELD_AUTH_TOKEN", "").strip()
+    """Return a Moxfield-issued read-only identifier without browser credentials."""
     user_agent = os.environ.get("MOXFIELD_USER_AGENT", "").strip()
-    if not token and not user_agent:
+    if not user_agent:
         raise RuntimeError(
-            "Moxfield is not configured. Set MOXFIELD_AUTH_TOKEN or a Moxfield-issued "
-            "MOXFIELD_USER_AGENT in .env."
+            "Moxfield is not configured. Set a Moxfield-issued MOXFIELD_USER_AGENT in .env."
         )
-    headers: dict[str, str] = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if user_agent:
-        headers["User-Agent"] = user_agent
-    return headers
+    return {"User-Agent": user_agent}
 
 
 def moxfield_mainboard(deck: object) -> str:

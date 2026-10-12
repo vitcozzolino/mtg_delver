@@ -20,11 +20,11 @@ The default backend now merges two evidence-grade sources: Videre's public MTGO 
 
 ## Moxfield community lists (optional)
 
-Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set one of these values in your local `.env` file:
+Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set this read-only identifier in your local `.env` file:
 
 ```bash
-# Current browser-session bearer token, or a read-only User-Agent issued by Moxfield.
-MOXFIELD_AUTH_TOKEN=replace-with-your-token
+# Request this from Moxfield for read-only access. Do not use a personal
+# browser-session token.
 MOXFIELD_USER_AGENT=
 
 # Quality guardrails for community lists; either threshold qualifies a list.
