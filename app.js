@@ -32,6 +32,7 @@ let datasets = {};
 const TOPDECK_FEED_URL = '/api/pioneer';
 const ARCHETYPE_FEED_URL = '/api/archetype';
 const COMMUNITY_FEED_URL = '/api/community';
+const CARD_PROFILE_URL = '/api/card-profiles';
 const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_Data/data-publish/data/latest/mtgo-decklists/pioneer.json';
 const selectArchetype = document.querySelector('#archetypeSelect');
 const selectDeck = document.querySelector('#deckSelect');
@@ -39,14 +40,76 @@ const range = document.querySelector('#recencyRange');
 const supplementLimit = document.querySelector('#supplementLimit');
 const moxfieldEnabled = document.querySelector('#moxfieldEnabled');
 const $ = (selector) => document.querySelector(selector);
-const isLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
+const fallbackIsLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
 const cardPreview = $('#cardPreview');
 const cardCache = new Map();
+const cardProfiles = new Map();
 let previewTimer;
 let currentPreviewName = '';
 let loadingMessageTimer;
 const MIN_LOADING_FEEDBACK_MS = 800;
 let archetypeLoadToken = 0;
+
+function profileFor(name) { return cardProfiles.get(name); }
+function isLand(name) {
+  const profile = profileFor(name);
+  return profile ? /\bLand\b/i.test(profile.type_line) : fallbackIsLand(name);
+}
+function primaryCardType(name) {
+  const typeLine = profileFor(name)?.type_line?.toLowerCase() || '';
+  if (typeLine.includes('land')) return 'land';
+  if (typeLine.includes('creature')) return 'creature';
+  if (typeLine.includes('planeswalker')) return 'planeswalker';
+  if (typeLine.includes('artifact')) return 'artifact';
+  if (typeLine.includes('enchantment')) return 'enchantment';
+  if (typeLine.includes('instant')) return 'instant';
+  if (typeLine.includes('sorcery')) return 'sorcery';
+  return 'other';
+}
+function cardRoles(name) {
+  const profile = profileFor(name);
+  const type = primaryCardType(name);
+  const text = (profile?.oracle_text || '').toLowerCase();
+  const roles = new Set();
+  if (type === 'land') roles.add('land');
+  if (type === 'creature' || type === 'planeswalker') roles.add('threat');
+  if (/counter target/.test(text)) roles.add('countermagic');
+  if (/(destroy|exile) target|deals? \d+ damage to target|fight target/.test(text)) roles.add('removal');
+  if (/draw (a|two|three|four) card|surveil|connive|loot/.test(text)) roles.add('selection');
+  if (/mill|discard|from your graveyard|escape|delve/.test(text)) roles.add('graveyard');
+  if (type === 'instant' || type === 'sorcery') roles.add('spell');
+  return roles;
+}
+function sharedRoleCount(first, second) {
+  let count = 0;
+  first.forEach(role => { if (second.has(role)) count++; });
+  return count;
+}
+function swapCompatibility(addName, cutName) {
+  const addType = primaryCardType(addName);
+  const cutType = primaryCardType(cutName);
+  if (addType === 'land' || cutType === 'land') return -Infinity;
+  const addRoles = cardRoles(addName);
+  const cutRoles = cardRoles(cutName);
+  const sharedRoles = sharedRoleCount(addRoles, cutRoles);
+  if (!sharedRoles && addType !== cutType) return -Infinity;
+  const addMana = Number(profileFor(addName)?.mana_value || 0);
+  const cutMana = Number(profileFor(cutName)?.mana_value || 0);
+  return sharedRoles * 100 + (addType === cutType ? 30 : 0) - Math.abs(addMana - cutMana) * 8;
+}
+async function ensureCardProfiles(archetype) {
+  const data = datasets[archetype];
+  if (!data) return;
+  const missing = [...new Set(data.decks.flatMap(deck => Object.keys(deck.cards)).filter(name => !cardProfiles.has(name)))];
+  for (let index = 0; index < missing.length; index += 75) {
+    const params = new URLSearchParams();
+    missing.slice(index, index + 75).forEach(name => params.append('name', name));
+    const response = await fetch(`${CARD_PROFILE_URL}?${params}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error('Card type data was unavailable');
+    const { profiles } = await response.json();
+    Object.entries(profiles || {}).forEach(([name, profile]) => cardProfiles.set(name, profile));
+  }
+}
 
 function setLoading(isLoading, title = 'Loading current decklists', detail = 'Connecting to the tournament sources…') {
   const overlay = $('#loadingOverlay');
@@ -163,6 +226,7 @@ async function enrichArchetype(archetype, days, { showLoading = false, forceRefr
       const selected = selectDeck.value;
       updateDeckChoices();
       selectDeck.value = selected;
+      try { await ensureCardProfiles(archetype); } catch (error) { console.warn(error.message); }
       render();
     }
   } catch (error) {
@@ -209,6 +273,7 @@ async function loadLiveData({ forceRefresh = false } = {}) {
     $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}${feed.cache?.status === 'hit' ? ' · cached' : ''}`;
     populateArchetypes('Izzet Phoenix');
     await enrichArchetype(selectArchetype.value, Number(range.value), { forceRefresh });
+    try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
     render();
   } catch (error) {
     $('#dataStatus').innerHTML = '<span class="status-dot"></span> Pioneer · feed unavailable';
@@ -321,25 +386,55 @@ function renderAnalysis(analysis) {
 }
 function renderExperiments(analysis) {
   const baseCards = Object.keys(analysis.base.cards);
-  const candidates = analysis.variants.filter(([name]) => !baseCards.includes(name)).sort((a,b)=>b[1].appearances-a[1].appearances).slice(0,3);
-  const cuts = baseCards.filter(card => !isLand(card) && analysis.totals[card].appearances < analysis.threshold).sort((a,b)=>analysis.totals[a].appearances-analysis.totals[b].appearances);
+  const experimentCards = [...new Set([
+    ...baseCards,
+    ...analysis.variants.map(([name]) => name),
+  ])];
+  if (experimentCards.some(name => !profileFor(name))) {
+    $('#experiments').innerHTML = '<p class="package-info">Analyzing card roles before proposing swaps…</p>';
+    return;
+  }
+  const candidates = analysis.variants
+    .filter(([name]) => !baseCards.includes(name) && primaryCardType(name) !== 'land')
+    .sort((a,b)=>b[1].appearances-a[1].appearances);
+  const cuts = baseCards
+    .filter(card => !isLand(card) && analysis.totals[card].appearances < analysis.threshold)
+    .sort((a,b)=>analysis.totals[a].appearances-analysis.totals[b].appearances);
   const template = $('#experimentTemplate'); const target = $('#experiments'); target.innerHTML = '';
-  candidates.forEach(([name, info], index) => {
-    const cut = cuts[index] || Object.keys(analysis.base.cards).find(card => !isLand(card) && analysis.totals[card].appearances === analysis.threshold);
+  const usedCuts = new Set();
+  const experiments = candidates.map(([name, info]) => {
+    const compatibleCuts = cuts
+      .filter(cut => !usedCuts.has(cut))
+      .map(cut => ({ cut, score: swapCompatibility(name, cut) }))
+      .filter(({ score }) => Number.isFinite(score) && score >= 30)
+      .sort((a, b) => b.score - a.score);
+    if (!compatibleCuts.length) return null;
+    const cut = compatibleCuts[0].cut;
+    usedCuts.add(cut);
+    const copies = Math.max(1, Math.min(
+      analysis.base.cards[cut],
+      Math.round(info.copies / info.appearances),
+    ));
+    return { name, info, cut, copies };
+  }).filter(Boolean).slice(0, 3);
+  experiments.forEach(({ name, info, cut, copies }, index) => {
     const fragment = template.content.cloneNode(true);
     fragment.querySelector('.experiment-number').textContent = String(index+1).padStart(2,'0');
     fragment.querySelector('.experiment-kicker').textContent = `SEEN IN ${info.appearances}/${analysis.decks.length} LISTS`;
     fragment.querySelector('h3').innerHTML = `Test ${cardLabel(name)}`;
-    fragment.querySelector('.experiment-reason').textContent = `${name} is the clearest recurring alternative absent from your baseline. Start with a small, reversible package before changing the engine.`;
-    fragment.querySelector('.swap-row').innerHTML = `<span class="cut"${cut ? ` data-card-name="${cut}" tabindex="0"` : ''}>− ${cut || 'flex slot'}</span><span class="swap-arrow">→</span><span class="add" data-card-name="${name}" tabindex="0">+ ${name}</span>`;
+    const sharedRoles = [...cardRoles(name)].filter(role => cardRoles(cut).has(role));
+    const roleLabel = sharedRoles.length ? `${sharedRoles.join(' / ')} role` : 'same card type';
+    fragment.querySelector('.experiment-reason').textContent = `${name} recurs as a ${roleLabel} alternative, at a compatible mana value. Test a small, reversible ${copies}-card package without changing the shared engine.`;
+    fragment.querySelector('.swap-row').innerHTML = `<span class="cut" data-card-name="${cut}" tabindex="0">− ${copies}× ${cut}</span><span class="swap-arrow">→</span><span class="add" data-card-name="${name}" tabindex="0">+ ${copies}× ${name}</span>`;
     fragment.querySelector('.queue-button').addEventListener('click', event => { event.currentTarget.classList.toggle('queued'); event.currentTarget.innerHTML = event.currentTarget.classList.contains('queued') ? 'Queued ✓' : 'Queue test <span>+</span>'; });
     target.append(fragment);
   });
-  if (!candidates.length) target.innerHTML = '<p class="package-info">No new packages are present in the sample. Add more source lists to broaden the search.</p>';
+  if (!experiments.length) target.innerHTML = '<p class="package-info">No role-compatible swaps are present in the sample. Add more source lists to broaden the search.</p>';
 }
 function render() { const analysis = getAnalysis(); renderDeck(analysis); renderAnalysis(analysis); renderExperiments(analysis); bindCardPreviews(); }
 selectArchetype.addEventListener('change', async () => {
   updateDeckChoices();
+  try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
   render();
   await enrichArchetype(selectArchetype.value, Number(range.value), { showLoading: true });
 });

@@ -32,6 +32,7 @@ MAX_VIDERE_DECKS = 1_000
 CACHE_DB = ROOT / "delver-cache.sqlite3"
 SOURCE_CACHE_TTL_SECONDS = 30 * 60
 ARCHETYPE_CACHE_TTL_SECONDS = 6 * 60 * 60
+CARD_PROFILE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_ARCHETYPE_DECKS = 20
 
 
@@ -62,6 +63,15 @@ def initialize_cache() -> None:
             CREATE TABLE IF NOT EXISTS cached_payloads (
                 cache_key TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
+                fetched_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS card_profiles (
+                card_name TEXT PRIMARY KEY,
+                profile TEXT NOT NULL,
                 fetched_at REAL NOT NULL
             )
             """
@@ -142,14 +152,19 @@ def iso_date(unix_seconds: object) -> str:
         return datetime.now(timezone.utc).date().isoformat()
 
 
-def fetch_json(url: str, timeout: int = 20, headers: dict[str, str] | None = None) -> object:
+def fetch_json(
+    url: str,
+    timeout: int = 20,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+) -> object:
     request_headers = {
         "Accept": "application/json",
         "User-Agent": "mtg-delver/0.1 (+https://github.com/vitcozzolino/mtg_delver)",
     }
     if headers:
         request_headers.update(headers)
-    request = Request(url, headers=request_headers)
+    request = Request(url, data=data, headers=request_headers, method="POST" if data else "GET")
     try:
         with urlopen(request, timeout=timeout) as response:
             return json.load(response)
@@ -176,6 +191,75 @@ def fetch_html(url: str, timeout: int = 20) -> str:
 
 def html_text(value: str) -> str:
     return unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def card_profile_from_scryfall(card: object) -> dict:
+    if not isinstance(card, dict):
+        return {"type_line": "", "mana_value": 0, "oracle_text": ""}
+    return {
+        "type_line": str(card.get("type_line") or ""),
+        "mana_value": card.get("cmc") if isinstance(card.get("cmc"), (int, float)) else 0,
+        "oracle_text": str(card.get("oracle_text") or ""),
+    }
+
+
+def fetch_card_profiles(names: list[str]) -> dict[str, dict]:
+    """Resolve card type/rules data once, then keep it in the local SQLite cache."""
+    requested = list(dict.fromkeys(name.strip() for name in names if name and name.strip()))[:75]
+    if not requested:
+        return {}
+    cached: dict[str, dict] = {}
+    missing: list[str] = []
+    now = time.time()
+    placeholders = ", ".join("?" for _ in requested)
+    with sqlite3.connect(CACHE_DB, timeout=5) as connection:
+        rows = connection.execute(
+            f"SELECT card_name, profile, fetched_at FROM card_profiles WHERE card_name IN ({placeholders})",
+            requested,
+        ).fetchall()
+    rows_by_name = {row[0]: row for row in rows}
+    for name in requested:
+        row = rows_by_name.get(name)
+        if not row or now - float(row[2]) >= CARD_PROFILE_CACHE_TTL_SECONDS:
+            missing.append(name)
+            continue
+        try:
+            profile = json.loads(row[1])
+        except (TypeError, json.JSONDecodeError):
+            missing.append(name)
+            continue
+        if isinstance(profile, dict):
+            cached[name] = profile
+        else:
+            missing.append(name)
+    if not missing:
+        return cached
+
+    payload = json.dumps({"identifiers": [{"name": name} for name in missing]}).encode()
+    response = fetch_json(
+        "https://api.scryfall.com/cards/collection",
+        headers={"Content-Type": "application/json"},
+        data=payload,
+    )
+    if not isinstance(response, dict):
+        raise RuntimeError("Scryfall returned an unexpected card-profile response")
+    resolved: dict[str, dict] = {}
+    for card in response.get("data", []):
+        if isinstance(card, dict) and isinstance(card.get("name"), str):
+            resolved[card["name"]] = card_profile_from_scryfall(card)
+    profiles_to_store: dict[str, dict] = {}
+    for name in missing:
+        profiles_to_store[name] = resolved.get(name, {"type_line": "", "mana_value": 0, "oracle_text": ""})
+    with sqlite3.connect(CACHE_DB, timeout=5) as connection:
+        connection.executemany(
+            """
+            INSERT INTO card_profiles (card_name, profile, fetched_at) VALUES (?, ?, ?)
+            ON CONFLICT(card_name) DO UPDATE SET profile = excluded.profile, fetched_at = excluded.fetched_at
+            """,
+            [(name, json.dumps(profile), now) for name, profile in profiles_to_store.items()],
+        )
+    cached.update(profiles_to_store)
+    return cached
 
 
 def archetype_slug(name: str) -> str:
@@ -730,6 +814,14 @@ class DelverHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/card-profiles":
+            names = parse_qs(parsed.query).get("name", [])
+            if not names:
+                return self._send_json(400, {"error": "At least one card name is required"})
+            try:
+                return self._send_json(200, {"profiles": fetch_card_profiles(names)})
+            except (RuntimeError, ValueError) as error:
+                return self._send_json(502, {"error": str(error)})
         if parsed.path == "/api/archetype":
             query = parse_qs(parsed.query)
             archetype = query.get("name", [""])[0].strip()
