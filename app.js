@@ -40,6 +40,29 @@ const cardPreview = $('#cardPreview');
 const cardCache = new Map();
 let previewTimer;
 let currentPreviewName = '';
+let loadingMessageTimer;
+const MIN_LOADING_FEEDBACK_MS = 800;
+
+function setLoading(isLoading, title = 'Loading current decklists', detail = 'Connecting to the tournament sources…') {
+  const overlay = $('#loadingOverlay');
+  const refresh = $('#refreshData');
+  const analyze = $('#analyzeButton');
+  clearInterval(loadingMessageTimer);
+  overlay.hidden = !isLoading;
+  document.body.classList.toggle('is-loading', isLoading);
+  document.querySelector('.app-shell').setAttribute('aria-busy', String(isLoading));
+  [selectArchetype, selectDeck, range, refresh, analyze].forEach(control => { control.disabled = isLoading; });
+  refresh.classList.toggle('is-spinning', isLoading);
+  if (!isLoading) return;
+  $('#loadingTitle').textContent = title;
+  const messages = [detail, 'Normalizing decklists and finding archetype matches…', 'Comparing the shared core against flex slots…'];
+  let messageIndex = 0;
+  $('#loadingDetail').textContent = messages[messageIndex];
+  loadingMessageTimer = setInterval(() => {
+    messageIndex = (messageIndex + 1) % messages.length;
+    $('#loadingDetail').textContent = messages[messageIndex];
+  }, 1800);
+}
 
 function parseMainboard(deckText) {
   const cards = {};
@@ -82,10 +105,9 @@ function buildLiveDatasets(feed) {
     }));
 }
 async function loadLiveData() {
-  const refresh = $('#refreshData');
-  const analyze = $('#analyzeButton');
-  refresh.disabled = true; analyze.disabled = true;
-  $('#dataStatus').innerHTML = '<span class="status-dot"></span> Updating live Pioneer data…';
+  const loadingStartedAt = Date.now();
+  setLoading(true, 'Refreshing Pioneer intelligence', 'Fetching recent MTGO and tournament decklists…');
+  $('#dataStatus').innerHTML = '<span class="status-dot is-loading"></span> Updating Pioneer data…';
   try {
     let feed;
     let sourceName = 'MTGO / Videre Project feed';
@@ -111,7 +133,7 @@ async function loadLiveData() {
     }
     datasets = buildLiveDatasets(feed);
     if (!Object.keys(datasets).length) throw new Error('No usable Pioneer lists returned');
-    range.min = 1; range.max = sourceName === 'TopDeck.gg API' ? 90 : feed.days; range.value = feed.days;
+    range.min = 1; range.max = 90; range.value = feed.days;
     $('#rangeOutput').textContent = `${feed.days} days`;
     const sourceWarnings = Array.isArray(feed.warnings) && feed.warnings.length ? ` · Source warnings: ${feed.warnings.join(' | ')}` : '';
     Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
@@ -123,7 +145,9 @@ async function loadLiveData() {
     $('#dataNote').textContent = `Couldn’t load the live feed: ${error.message}. Refresh to retry.`;
     $('#summaryGrid').innerHTML = '';
   } finally {
-    refresh.disabled = false; analyze.disabled = false;
+    const remainingFeedbackTime = MIN_LOADING_FEEDBACK_MS - (Date.now() - loadingStartedAt);
+    if (remainingFeedbackTime > 0) await new Promise(resolve => setTimeout(resolve, remainingFeedbackTime));
+    setLoading(false);
   }
 }
 
