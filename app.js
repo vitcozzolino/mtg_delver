@@ -371,9 +371,19 @@ function renderDeck(analysis) {
   const { base, totals, threshold } = analysis;
   $('#baselineTitle').textContent = base.name;
   $('#baselineMeta').innerHTML = `${base.finish}<br>${base.date}${base.player ? `<br>${base.player}` : ''}`;
-  const sections = { Spells: [], Lands: [] };
-  Object.entries(base.cards).sort((a,b) => a[0].localeCompare(b[0])).forEach(([name, quantity]) => sections[isLand(name) ? 'Lands' : 'Spells'].push([name, quantity]));
-  $('#deckList').innerHTML = Object.entries(sections).map(([section,cards]) => `<div class="section-name">${section}</div>${cards.map(([name,quantity]) => `<div class="deck-row ${totals[name].appearances >= threshold && section !== 'Lands' ? 'core' : ''} ${section === 'Lands' ? 'land' : ''}"><span class="quantity" title="Copies in your selected list">${quantity}×</span>${cardLabel(name, 'card-name')}<span class="delta" title="Sampled lists containing this card">${totals[name].appearances}/${analysis.decks.length} lists</span></div>`).join('')}`).join('');
+  const sectionOrder = ['Creatures', 'Planeswalkers', 'Instants', 'Sorceries', 'Artifacts', 'Enchantments', 'Other spells', 'Lands'];
+  const sectionForType = {
+    creature: 'Creatures', planeswalker: 'Planeswalkers', instant: 'Instants', sorcery: 'Sorceries',
+    artifact: 'Artifacts', enchantment: 'Enchantments', land: 'Lands', other: 'Other spells',
+  };
+  const sections = Object.fromEntries(sectionOrder.map(section => [section, []]));
+  Object.entries(base.cards)
+    .sort((a,b) => a[0].localeCompare(b[0]))
+    .forEach(([name, quantity]) => sections[sectionForType[primaryCardType(name)]].push([name, quantity]));
+  $('#deckList').innerHTML = sectionOrder
+    .filter(section => sections[section].length)
+    .map(section => `<div class="section-name">${section}</div>${sections[section].map(([name,quantity]) => `<div class="deck-row ${totals[name].appearances >= threshold && section !== 'Lands' ? 'core' : ''} ${section === 'Lands' ? 'land' : ''}"><span class="quantity" title="Copies in your selected list">${quantity}×</span>${cardLabel(name, 'card-name')}<span class="delta" title="Sampled lists containing this card">${totals[name].appearances}/${analysis.decks.length} lists</span></div>`).join('')}`)
+    .join('');
 }
 function renderAnalysis(analysis) {
   const totalCards = Object.values(analysis.base.cards).reduce((a,b)=>a+b,0);
