@@ -228,7 +228,7 @@ def fetch_card_profiles(names: list[str]) -> dict[str, dict]:
         except (TypeError, json.JSONDecodeError):
             missing.append(name)
             continue
-        if isinstance(profile, dict):
+        if isinstance(profile, dict) and profile.get("type_line"):
             cached[name] = profile
         else:
             missing.append(name)
@@ -244,9 +244,16 @@ def fetch_card_profiles(names: list[str]) -> dict[str, dict]:
     if not isinstance(response, dict):
         raise RuntimeError("Scryfall returned an unexpected card-profile response")
     resolved: dict[str, dict] = {}
+    requested_by_normalized_name = {name.casefold(): name for name in missing}
     for card in response.get("data", []):
         if isinstance(card, dict) and isinstance(card.get("name"), str):
-            resolved[card["name"]] = card_profile_from_scryfall(card)
+            profile = card_profile_from_scryfall(card)
+            # Scryfall identifies adventures and modal double-faced cards by
+            # their combined name, while decklists commonly use the front face.
+            for card_name in card["name"].split(" // "):
+                requested_name = requested_by_normalized_name.get(card_name.casefold())
+                if requested_name:
+                    resolved[requested_name] = profile
     profiles_to_store: dict[str, dict] = {}
     for name in missing:
         profiles_to_store[name] = resolved.get(name, {"type_line": "", "mana_value": 0, "oracle_text": ""})
