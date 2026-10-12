@@ -5,3 +5,13 @@ description = "A Pioneer Magic: The Gathering deck explorer"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.scripts]
+delver = "server:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]

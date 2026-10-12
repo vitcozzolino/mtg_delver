@@ -31,7 +31,7 @@ uv run python setup_key.py
 After that, starting the Python backend needs no export or key entry:
 
 ```bash
-uv run python server.py
+uv run delver
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. The recency slider uses 1–90 days. The UI visibly credits the active data source. The key remains local for optional TopDeck support, but the default Pioneer sample is now Videre + Spicerack because TopDeck currently exposes too few public Pioneer decklists.

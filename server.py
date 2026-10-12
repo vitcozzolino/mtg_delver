@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+from errno import EADDRINUSE
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -354,8 +355,16 @@ class DelverHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 8080), DelverHandler)
+    except OSError as error:
+        if error.errno == EADDRINUSE:
+            raise SystemExit(
+                "Delver is already running at http://127.0.0.1:8080 — open that URL instead."
+            ) from error
+        raise
     print("Delver is available at http://127.0.0.1:8080")
-    ThreadingHTTPServer(("127.0.0.1", 8080), DelverHandler).serve_forever()
+    server.serve_forever()
 
 
 if __name__ == "__main__":
