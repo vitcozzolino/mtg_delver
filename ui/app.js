@@ -522,7 +522,9 @@ function updateDeckChoices() {
 }
 function updateCardLabLink(analysis) {
   const archetype = selectArchetype.value;
-  $('#cardLabLink').href = archetype ? `./card-lab.html?archetype=${encodeURIComponent(archetype)}` : './card-lab.html';
+  const destination = archetype ? `./card-lab.html?archetype=${encodeURIComponent(archetype)}` : './card-lab.html';
+  $('#cardLabLink').href = destination;
+  $('#baselineCardLabLink').href = destination;
   if (!analysis) return;
   sessionStorage.setItem('delver-card-lab-baseline', JSON.stringify({
     archetype,

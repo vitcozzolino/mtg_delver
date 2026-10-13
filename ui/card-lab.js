@@ -17,6 +17,12 @@ const chatgptConnection = document.querySelector('#chatgptConnection');
 const connectChatGPTButton = document.querySelector('#connectChatGPT');
 const chatgptModelWrap = document.querySelector('#chatgptModelWrap');
 const chatgptModel = document.querySelector('#chatgptModel');
+const labBrief = document.querySelector('#labBrief');
+const briefPriority = document.querySelector('#briefPriority');
+const briefScope = document.querySelector('#briefScope');
+const briefSameType = document.querySelector('#briefSameType');
+const briefSameMana = document.querySelector('#briefSameMana');
+const briefSpellDensity = document.querySelector('#briefSpellDensity');
 const cardCache = new Map();
 let previewTimer;
 let currentPreviewName = '';
@@ -56,6 +62,34 @@ function loadBaseline() {
     baselineContext.textContent = `Using ${baseline.deckName || 'the selected'} mainboard: existing cards are excluded from replacement suggestions.`;
     baselineContext.classList.add('active');
   }
+}
+function currentDeckbuilderBrief() {
+  return {
+    goal: labBrief.value.trim(),
+    priority: briefPriority.value,
+    scope: briefScope.value,
+    constraints: {
+      same_primary_type: briefSameType.checked,
+      same_mana_value: briefSameMana.checked,
+      preserve_spell_density: briefSpellDensity.checked,
+    },
+  };
+}
+function persistDeckbuilderBrief() {
+  sessionStorage.setItem('delver-card-lab-brief', JSON.stringify(currentDeckbuilderBrief()));
+}
+function restoreDeckbuilderBrief() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem('delver-card-lab-brief') || 'null');
+    if (!saved || typeof saved !== 'object') return;
+    if (typeof saved.goal === 'string') labBrief.value = saved.goal.slice(0, 600);
+    if ([...briefPriority.options].some(option => option.value === saved.priority)) briefPriority.value = saved.priority;
+    if ([...briefScope.options].some(option => option.value === saved.scope)) briefScope.value = saved.scope;
+    const constraints = saved.constraints || {};
+    briefSameType.checked = Boolean(constraints.same_primary_type);
+    briefSameMana.checked = Boolean(constraints.same_mana_value);
+    briefSpellDensity.checked = constraints.preserve_spell_density !== false;
+  } catch { /* A malformed local preference should never block Card Lab. */ }
 }
 function scoreLabel(score) {
   if (score >= 80) return 'strong fit';
@@ -192,6 +226,13 @@ function renderResults(payload) {
   document.querySelector('#strategyName').textContent = payload.strategy;
   document.querySelector('#winPlan').textContent = payload.win_plan;
   document.querySelector('#labMethod').textContent = payload.method;
+  const briefResult = document.querySelector('#briefResult');
+  const brief = payload.deckbuilder_brief || {};
+  const briefItems = [
+    ...(brief.goal ? [`Goal: ${brief.goal}`] : []),
+    ...(Array.isArray(payload.brief_summary) ? payload.brief_summary : []),
+  ];
+  briefResult.innerHTML = briefItems.map(item => `<span>${escapeHtml(item)}</span>`).join('');
   const reviewNote = document.querySelector('#aiReviewNote');
   if (payload.ai_review?.status === 'complete') {
     const provider = payload.ai_review.provider_label || 'AI';
@@ -208,12 +249,14 @@ function renderResults(payload) {
     ? payload.alternatives.map(card => `<article class="alternative-card">
         <div class="alternative-card-top">
           <div><p class="alternative-score">${escapeHtml(card.ai_review?.verdict || scoreLabel(card.score))} · ${escapeHtml(card.ai_review?.score ?? card.score)}</p><h3><a data-card-name="${escapeHtml(card.name)}" href="${escapeHtml(card.scryfall_uri)}" target="_blank" rel="noreferrer">${escapeHtml(card.name)} ↗</a></h3></div>
-          <span class="mana-value">MV ${escapeHtml(card.mana_value)}</span>
+          <div class="alternative-badges">${card.current_era ? `<span class="current-era-badge">${escapeHtml(card.released_at.slice(0, 4))} print</span>` : ''}<span class="mana-value">MV ${escapeHtml(card.mana_value)}</span></div>
         </div>
-        <p class="alternative-type">${escapeHtml(card.type_line)}</p>
+        <p class="alternative-type">${escapeHtml(card.type_line)}${card.released_at ? ` · latest print ${escapeHtml(card.released_at)}` : ''}</p>
         ${card.ai_review
           ? `<p><strong>Deckbuilder:</strong> ${escapeHtml(card.ai_review.rationale)}</p>${card.ai_review.cautions.length ? `<p><strong>Watch for:</strong> ${escapeHtml(card.ai_review.cautions.join(' · '))}</p>` : ''}`
           : `<p><strong>Functional:</strong> ${escapeHtml(card.functional_reason)}</p><p><strong>Plan:</strong> ${escapeHtml(card.plan_reason)}</p>`}
+        ${card.brief_matches?.length ? `<p class="brief-card-note"><strong>Brief fit:</strong> ${escapeHtml(card.brief_matches.join(' · '))}</p>` : ''}
+        ${card.brief_tradeoffs?.length ? `<p class="brief-card-note tradeoff"><strong>Tradeoff:</strong> ${escapeHtml(card.brief_tradeoffs.join(' · '))}</p>` : ''}
         <div class="role-chips">${card.roles.map(role => `<span>${escapeHtml(role.replace('_', ' '))}</span>`).join('')}</div>
       </article>`).join('')
     : '<p class="empty-results">No close heuristic matches cleared the quality threshold. Try a different card or use the result as a signal that this effect is unusually unique in Pioneer.</p>';
@@ -230,6 +273,9 @@ async function findAlternatives(event) {
   button.disabled = true;
   try {
     const params = new URLSearchParams({ card, archetype: archetypeSelect.value });
+    const brief = currentDeckbuilderBrief();
+    persistDeckbuilderBrief();
+    params.set('brief', JSON.stringify(brief));
     if (chatgptModelsLoaded && chatgptModel.value) params.set('model', chatgptModel.value);
     if (baseline?.archetype === archetypeSelect.value) {
       baseline.cards.forEach(card => {
@@ -248,7 +294,8 @@ async function findAlternatives(event) {
     const reviewNote = review?.status === 'complete'
       ? ` · ${review.provider_label || 'AI'} reviewed ${review.reviewed}, rejected ${review.rejected}`
       : review?.status === 'unavailable' ? ' · deckbuilding review unavailable' : '';
-    labStatus.textContent = `${payload.alternatives.length} candidates ranked for ${payload.archetype}${baselineNote}${reviewNote}${cacheNote}.`;
+    const briefNote = payload.brief_summary?.length ? ` · ${payload.brief_summary.length} brief rules applied` : '';
+    labStatus.textContent = `${payload.alternatives.length} candidates ranked for ${payload.archetype}${briefNote}${baselineNote}${reviewNote}${cacheNote}.`;
   } catch (error) {
     labStatus.textContent = error.message || 'Card Lab could not complete the search.';
   } finally {
@@ -263,7 +310,11 @@ archetypeSelect.addEventListener('change', () => {
 document.querySelector('#cardLabForm').addEventListener('submit', findAlternatives);
 connectChatGPTButton.addEventListener('click', connectChatGPT);
 chatgptModel.addEventListener('change', () => sessionStorage.setItem('delver-chatgpt-model', chatgptModel.value));
+[labBrief, briefPriority, briefScope, briefSameType, briefSameMana, briefSpellDensity]
+  .forEach(element => element.addEventListener('change', persistDeckbuilderBrief));
+labBrief.addEventListener('input', persistDeckbuilderBrief);
 populateArchetypes();
 loadBaseline();
 populateExamples();
+restoreDeckbuilderBrief();
 loadChatGPTStatus();

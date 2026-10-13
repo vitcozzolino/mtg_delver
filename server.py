@@ -46,7 +46,9 @@ CACHE_DB = ROOT / "delver-cache.sqlite3"
 SOURCE_CACHE_TTL_SECONDS = 30 * 60
 ARCHETYPE_CACHE_TTL_SECONDS = 6 * 60 * 60
 CARD_PROFILE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
-CARD_ALTERNATIVE_CACHE_TTL_SECONDS = 24 * 60 * 60
+# The card pool is live Scryfall data. Twelve hours keeps set-release updates
+# reasonably quick while avoiding repeated multi-page lookups per search.
+CARD_ALTERNATIVE_CACHE_TTL_SECONDS = 12 * 60 * 60
 CARD_LAB_REVIEW_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_CARD_LAB_MODEL = "gpt-5.6-terra"
@@ -868,6 +870,7 @@ def card_lab_card(card: object) -> dict | None:
         "oracle_text": oracle_text,
         "mana_value": mana_value,
         "effective_mana_value": effective_mana_value,
+        "released_at": str(card.get("released_at") or ""),
         "colors": colors,
         "roles": sorted(card_lab_roles(type_line, oracle_text)),
         "scryfall_uri": card.get("scryfall_uri") or "",
@@ -914,6 +917,161 @@ def card_lab_score(source: dict, candidate: dict, plan: dict) -> tuple[int, list
     return score, shared_roles, plan_roles
 
 
+CARD_LAB_BRIEF_PRIORITIES = {
+    "": set(),
+    "selection": {"selection"},
+    "graveyard": {"graveyard", "recursion"},
+    "interaction": {"countermagic", "removal", "tempo"},
+    "threat": {"threat"},
+    "mana": {"ramp", "devotion"},
+}
+
+
+def card_lab_brief(raw: object) -> dict:
+    """Normalize the user-controlled replacement brief to a safe small contract."""
+    raw = raw if isinstance(raw, dict) else {}
+    raw_constraints = raw.get("constraints") if isinstance(raw.get("constraints"), dict) else {}
+    priority = str(raw.get("priority") or "").strip().casefold()
+    scope = str(raw.get("scope") or "balanced").strip().casefold()
+    return {
+        "goal": str(raw.get("goal") or "").strip()[:600],
+        "priority": priority if priority in CARD_LAB_BRIEF_PRIORITIES else "",
+        "scope": scope if scope in {"conservative", "balanced", "exploratory"} else "balanced",
+        "constraints": {
+            "same_primary_type": bool(raw_constraints.get("same_primary_type")),
+            "same_mana_value": bool(raw_constraints.get("same_mana_value")),
+            "preserve_spell_density": bool(raw_constraints.get("preserve_spell_density")),
+        },
+    }
+
+
+def card_lab_brief_summary(brief: dict) -> list[str]:
+    constraints = brief["constraints"]
+    labels = []
+    if constraints["same_primary_type"]:
+        labels.append("same primary type")
+    if constraints["same_mana_value"]:
+        labels.append("same mana value")
+    if constraints["preserve_spell_density"]:
+        labels.append("preserve spell density")
+    priority_labels = {
+        "selection": "prioritize card selection",
+        "graveyard": "prioritize graveyard setup",
+        "interaction": "prioritize interaction",
+        "threat": "prioritize a threat",
+        "mana": "prioritize mana development",
+    }
+    if brief["priority"]:
+        labels.append(priority_labels[brief["priority"]])
+    labels.append({
+        "conservative": "closest functional matches",
+        "balanced": "balanced search",
+        "exploratory": "exploratory search",
+    }[brief["scope"]])
+    return labels
+
+
+def card_lab_current_release_cutoff() -> str:
+    return f"{datetime.now(timezone.utc).year}-01-01"
+
+
+def card_lab_visible_candidates(candidates: list[dict], *, limit: int = 12) -> list[dict]:
+    """Keep strong staples while reserving result-space for this year's sets."""
+    cutoff = card_lab_current_release_cutoff()
+    established_slots = max(1, limit - 4)
+    chosen = list(candidates[:established_slots])
+    chosen_names = {str(candidate.get("name") or "").casefold() for candidate in chosen}
+    for candidate in candidates:
+        if len(chosen) >= limit:
+            break
+        name = str(candidate.get("name") or "").casefold()
+        if str(candidate.get("released_at") or "") >= cutoff and name not in chosen_names:
+            chosen.append(candidate)
+            chosen_names.add(name)
+    for candidate in candidates:
+        if len(chosen) >= limit:
+            break
+        name = str(candidate.get("name") or "").casefold()
+        if name not in chosen_names:
+            chosen.append(candidate)
+            chosen_names.add(name)
+    return [
+        {**candidate, "current_era": str(candidate.get("released_at") or "") >= cutoff}
+        for candidate in chosen
+    ]
+
+
+def apply_card_lab_brief(payload: dict, brief: dict) -> dict:
+    """Apply deterministic user constraints before an AI reviewer can rank cards.
+
+    The brief is intentionally a filter/scorer rather than a natural-language
+    parser: a free-form goal informs the review, while controls visibly enforce
+    the promises that must not be traded away.
+    """
+    source = payload["source_card"]
+    source_type = card_lab_primary_type(source["type_line"])
+    source_roles = set(source["roles"])
+    required_roles = card_lab_required_roles(source_roles)
+    requested_roles = CARD_LAB_BRIEF_PRIORITIES[brief["priority"]]
+    constraints = brief["constraints"]
+    filtered: list[dict] = []
+    for candidate in payload.get("alternatives", []):
+        candidate_type = card_lab_primary_type(candidate["type_line"])
+        candidate_roles = set(candidate["roles"])
+        mana_delta = abs(float(source["mana_value"]) - float(candidate["mana_value"]))
+        if constraints["same_primary_type"] and candidate_type != source_type:
+            continue
+        if constraints["same_mana_value"] and mana_delta > 0.01:
+            continue
+        if (
+            constraints["preserve_spell_density"]
+            and "spell" in source_roles
+            and "spell" not in candidate_roles
+        ):
+            continue
+        # Conservative is deliberately defined as a tight *functional* search,
+        # not as a claim about tournament metagame adoption.
+        if brief["scope"] == "conservative" and (
+            candidate_type != source_type
+            or mana_delta > 1
+            or (required_roles and not required_roles.issubset(candidate_roles))
+        ):
+            continue
+        if requested_roles and not (candidate_roles & requested_roles):
+            continue
+        matched = []
+        if constraints["same_primary_type"]:
+            matched.append("same primary type")
+        if constraints["same_mana_value"]:
+            matched.append("same mana value")
+        if constraints["preserve_spell_density"] and "spell" in source_roles:
+            matched.append("spell density")
+        if requested_roles:
+            matched.append("requested role")
+        tradeoffs = []
+        if candidate_type != source_type:
+            tradeoffs.append(f"changes {source_type} into {candidate_type}")
+        if mana_delta > 0.01:
+            tradeoffs.append(f"mana value {source['mana_value']} → {candidate['mana_value']}")
+        missing_roles = required_roles - candidate_roles
+        if missing_roles:
+            tradeoffs.append(f"does not retain {', '.join(sorted(missing_roles))}")
+        score_boost = 14 if requested_roles else 0
+        filtered.append({
+            **candidate,
+            "score": candidate["score"] + score_boost,
+            "brief_matches": matched,
+            "brief_tradeoffs": tradeoffs,
+        })
+    filtered.sort(key=lambda candidate: (-candidate["score"], candidate["mana_value"], candidate["name"]))
+    return {
+        **payload,
+        "alternatives": filtered,
+        "deckbuilder_brief": brief,
+        "brief_summary": card_lab_brief_summary(brief),
+    }
+
+
 def fetch_card_alternatives(
     card_name: str,
     archetype: str,
@@ -921,12 +1079,13 @@ def fetch_card_alternatives(
     excluded_cards: set[str] | None = None,
     mainboard: list[dict] | None = None,
     review_model: str | None = None,
+    brief: object = None,
     force_refresh: bool = False,
 ) -> dict:
     plan = CARD_LAB_ARCHETYPES.get(archetype)
     if not plan:
         raise RuntimeError(f"Card Lab does not have a strategy profile for {archetype} yet")
-    cache_key = f"card-lab:v2:{archetype_slug(archetype)}:{card_name.casefold()}"
+    cache_key = f"card-lab:v4:{archetype_slug(archetype)}:{card_name.casefold()}"
     payload = cached_fetch(
         cache_key,
         CARD_ALTERNATIVE_CACHE_TTL_SECONDS,
@@ -946,8 +1105,9 @@ def fetch_card_alternatives(
             ],
             "excluded_cards": len(excluded),
         }
+    brief_payload = apply_card_lab_brief(filtered_payload, card_lab_brief(brief))
     return review_card_alternatives_with_llm(
-        filtered_payload,
+        brief_payload,
         mainboard=mainboard or [],
         review_model=review_model,
         force_refresh=force_refresh,
@@ -984,8 +1144,11 @@ def card_lab_review_schema() -> dict:
                             "name": {"type": "string"},
                             "verdict": {"type": "string", "enum": ["recommended", "situational", "reject"]},
                             "score": {"type": "integer", "minimum": 0, "maximum": 100},
-                            "rationale": {"type": "string"},
-                            "cautions": {"type": "array", "items": {"type": "string"}},
+                            "rationale": {"type": "string", "maxLength": 240},
+                            "cautions": {
+                                "type": "array", "maxItems": 2,
+                                "items": {"type": "string", "maxLength": 110},
+                            },
                         },
                         "required": ["name", "verdict", "score", "rationale", "cautions"],
                         "additionalProperties": False,
@@ -1002,13 +1165,15 @@ def card_lab_review_prompt(payload: dict, mainboard: list[dict]) -> str:
     source = payload["source_card"]
     # Review the strongest heuristic matches only. This keeps the structured
     # response bounded and avoids making the user wait on a long plan request.
-    candidates = payload.get("alternatives", [])[:8]
+    candidates = payload.get("alternatives", [])[:6]
     return json.dumps({
         "task": "Judge these possible Pioneer deck replacements. Return one review for every candidate supplied.",
         "format": "Pioneer",
         "archetype": payload["archetype"],
         "strategy": payload["strategy"],
         "win_plan": payload["win_plan"],
+        "deckbuilder_brief": payload.get("deckbuilder_brief", {}),
+        "brief_summary": payload.get("brief_summary", []),
         "baseline_mainboard": card_lab_mainboard_lines(mainboard),
         "source_card": {
             "name": source["name"], "type_line": source["type_line"],
@@ -1026,7 +1191,9 @@ def card_lab_review_prompt(payload: dict, mainboard: list[dict]) -> str:
             "Reject a candidate that does not preserve the source card's important function in this deck.",
             "Reject narrow hate cards as general replacements unless the baseline and matchup role clearly justify them.",
             "For Izzet Phoenix, distinguish cantrips/graveyard velocity from removal, and preserve spell density only when the card also has the needed job.",
-            "Keep rationales concrete and short; name the strategic tradeoff where one exists.",
+            "Treat the brief constraints as hard requirements; do not recommend a candidate that breaks one.",
+            "Use the free-text goal as decision context. State which requested goal or constraint the candidate preserves, and any remaining strategic tradeoff.",
+            "Keep each rationale to one sentence (40 words maximum) and each caution to a short phrase.",
         ],
     })
 
@@ -1043,6 +1210,35 @@ def output_text_from_response(response: object) -> str:
             if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
                 return part["text"]
     return ""
+
+
+def card_lab_review_candidates(candidates: list[dict]) -> list[dict]:
+    """Mix recent-set exploration into the compact AI review batch.
+
+    The deterministic score still owns the first four slots. Two further
+    slots are reserved for current-year Pioneer printings with the same hard role
+    filters, so a new-set idea is not silently buried behind established
+    staples before the deckbuilding review can assess it.
+    """
+    chosen = list(candidates[:4])
+    chosen_names = {str(candidate.get("name") or "").casefold() for candidate in chosen}
+    recent = [
+        candidate for candidate in candidates
+        if str(candidate.get("released_at") or "") >= card_lab_current_release_cutoff()
+        and str(candidate.get("name") or "").casefold() not in chosen_names
+    ]
+    for candidate in recent:
+        if len(chosen) >= 6:
+            break
+        chosen.append(candidate)
+        chosen_names.add(str(candidate.get("name") or "").casefold())
+    for candidate in candidates:
+        if len(chosen) >= 6:
+            break
+        if str(candidate.get("name") or "").casefold() not in chosen_names:
+            chosen.append(candidate)
+            chosen_names.add(str(candidate.get("name") or "").casefold())
+    return chosen
 
 
 def review_card_alternatives_with_llm(
@@ -1067,17 +1263,21 @@ def review_card_alternatives_with_llm(
     else:
         detail = plan_error or "Connect ChatGPT to enable a plan-backed deckbuilding review."
         return {**payload, "ai_review": {"status": "unavailable", "detail": detail}}
-    candidates = payload.get("alternatives", [])
+    # Keep the model pass deliberately compact, while reserving review space
+    # for a couple of current-era Pioneer printings.
+    candidates = card_lab_review_candidates(payload.get("alternatives", []))
     if not candidates:
         return {**payload, "ai_review": {"status": "skipped", "detail": "No heuristic candidates to review."}}
+    review_context = {**payload, "alternatives": candidates}
     context_fingerprint = sha256(json.dumps({
         "mainboard": card_lab_mainboard_lines(mainboard),
         "candidates": [card["name"] for card in candidates],
         "source": payload["source_card"]["name"],
         "archetype": payload["archetype"],
+        "brief": payload.get("deckbuilder_brief", {}),
         "model": review_model or os.environ.get("OPENAI_MODEL", OPENAI_CARD_LAB_MODEL),
     }, sort_keys=True).encode()).hexdigest()[:20]
-    cache_key = f"card-lab:review:v2:{provider}:{context_fingerprint}"
+    cache_key = f"card-lab:review:v4:{provider}:{context_fingerprint}"
 
     def request_review() -> dict:
         request_payload = {
@@ -1085,11 +1285,15 @@ def review_card_alternatives_with_llm(
             "instructions": "You are a precise competitive Magic: The Gathering Pioneer deckbuilder. Follow the supplied rules text and return only the requested JSON schema.",
             # ChatGPT plan inference requires the Responses message-list form
             # (the API-key path accepts it too), rather than a bare string.
-            "input": [{"role": "user", "content": card_lab_review_prompt(payload, mainboard)}],
-            "reasoning": {"effort": "low"},
-            # Structured reviews for a dozen candidates can exceed 1,400
-            # tokens (especially with reasoning). Leave room to finish.
-            "max_output_tokens": 2_000,
+            "input": [{"role": "user", "content": card_lab_review_prompt(review_context, mainboard)}],
+            # Terra supports ``none`` (rather than ``minimal``). The
+            # deterministic layer already narrows the field, so reserve the
+            # completion budget for the strict JSON review.
+            "reasoning": {"effort": "none"},
+            # Reasoning tokens count toward this ceiling. Six tightly bounded
+            # reviews plus 4k total output gives Terra room to reason and
+            # still close the strict JSON object instead of ending incomplete.
+            "max_output_tokens": 4_000,
             "store": False,
             "text": {"format": card_lab_review_schema()},
         }
@@ -1146,6 +1350,30 @@ def review_card_alternatives_with_llm(
     }}
 
 
+def fetch_scryfall_card_pool(query: str, *, max_pages: int = 4) -> list[dict]:
+    """Load a bounded, recency-first Pioneer pool instead of one search page.
+
+    Scryfall pages contain up to 175 cards. Four cached pages cover 700
+    candidates, while ``order=released`` makes cards from current sets appear
+    even when a very broad role query has more results than that cap.
+    """
+    url = f"https://api.scryfall.com/cards/search?{urlencode({'q': query, 'unique': 'cards', 'order': 'released', 'dir': 'desc'})}"
+    cards: list[dict] = []
+    for page_index in range(max_pages):
+        payload = fetch_json(url)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            break
+        cards.extend(card for card in payload["data"] if isinstance(card, dict))
+        next_page = payload.get("next_page")
+        if not payload.get("has_more") or not isinstance(next_page, str) or not next_page:
+            break
+        url = next_page
+        # Stay comfortably below Scryfall's public request-rate guidance.
+        if page_index + 1 < max_pages:
+            time.sleep(0.1)
+    return cards
+
+
 def fetch_card_alternatives_live(card_name: str, archetype: str, plan: dict) -> dict:
     source_payload = fetch_json(
         f"https://api.scryfall.com/cards/named?{urlencode({'exact': card_name})}"
@@ -1158,13 +1386,11 @@ def fetch_card_alternatives_live(card_name: str, archetype: str, plan: dict) -> 
     query = card_lab_query(
         card_lab_primary_type(source["type_line"]), plan["colors"], source_roles
     )
-    candidates_payload = fetch_json(
-        f"https://api.scryfall.com/cards/search?{urlencode({'q': query, 'unique': 'cards', 'order': 'cmc'})}"
-    )
-    if not isinstance(candidates_payload, dict) or not isinstance(candidates_payload.get("data"), list):
+    raw_candidates = fetch_scryfall_card_pool(query)
+    if not raw_candidates:
         raise RuntimeError("Scryfall returned no compatible Pioneer card pool")
     alternatives: list[dict] = []
-    for raw_candidate in candidates_payload["data"]:
+    for raw_candidate in raw_candidates:
         candidate = card_lab_card(raw_candidate)
         if not candidate:
             continue
@@ -1189,16 +1415,23 @@ def fetch_card_alternatives_live(card_name: str, archetype: str, plan: dict) -> 
             "functional_reason": f"Shares {functional_reason} with {source['name']}.",
             "plan_reason": f"Supports {plan_reason} in this {plan['strategy'].casefold()} shell.",
         })
-    alternatives.sort(key=lambda candidate: (-candidate["score"], candidate["mana_value"], candidate["name"]))
+    # Newness is only a tie-breaker: functional score remains the reason a
+    # card appears first, while a current-set option wins against an otherwise
+    # identical older fit.
+    alternatives.sort(key=lambda candidate: candidate["name"])
+    alternatives.sort(
+        key=lambda candidate: (candidate["score"], candidate.get("released_at", "")),
+        reverse=True,
+    )
     return {
         "kind": "card_lab_alternatives",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "method": "Pioneer legality + non-generic functional-role + archetype-plan hard filters",
+        "method": "Live, paginated Pioneer legality + functional-role + archetype-plan filters (four current-year slots reserved)",
         "source_card": source,
         "archetype": archetype,
         "strategy": plan["strategy"],
         "win_plan": plan["win_plan"],
-        "alternatives": alternatives[:12],
+        "alternatives": card_lab_visible_candidates(alternatives),
     }
 
 
@@ -2103,14 +2336,21 @@ class DelverHandler(SimpleHTTPRequestHandler):
                 mainboard = json.loads(query.get("mainboard", ["[]"])[0])
             except json.JSONDecodeError:
                 return self._send_json(400, {"error": "The Card Lab mainboard context is invalid"})
+            try:
+                brief = json.loads(query.get("brief", ["{}"])[0])
+            except json.JSONDecodeError:
+                return self._send_json(400, {"error": "The Deckbuilder Brief is invalid"})
             if not isinstance(mainboard, list):
                 return self._send_json(400, {"error": "The Card Lab mainboard context must be a list"})
+            if not isinstance(brief, dict):
+                return self._send_json(400, {"error": "The Deckbuilder Brief must be an object"})
             if not card_name or not archetype:
                 return self._send_json(400, {"error": "A card name and archetype are required"})
             try:
                 return self._send_json(200, fetch_card_alternatives(
                     card_name, archetype, excluded_cards=excluded_cards,
                     mainboard=mainboard, review_model=review_model or None,
+                    brief=brief,
                     force_refresh=force_refresh,
                 ))
             except (RuntimeError, ValueError) as error:

@@ -37,6 +37,47 @@
         <button class="primary-button" type="submit">Find alternatives <span>→</span></button>
       </form>
 
+      <section class="deckbuilder-brief" aria-labelledby="briefTitle">
+        <div class="brief-heading">
+          <div>
+            <p class="eyebrow">DECKBUILDER BRIEF</p>
+            <h2 id="briefTitle">What are you trying to change?</h2>
+          </div>
+          <p>Hard constraints filter the pool first. Your note then gives the reviewer the why.</p>
+        </div>
+        <label class="brief-goal" for="labBrief">
+          <span>Goal or context <em>optional</em></span>
+          <textarea id="labBrief" rows="2" maxlength="600" placeholder="e.g. I want more graveyard velocity without making the deck worse against creature decks."></textarea>
+        </label>
+        <div class="brief-options">
+          <label class="field">
+            <span>Prioritize</span>
+            <select id="briefPriority">
+              <option value="">Keep the current job</option>
+              <option value="selection">Card selection</option>
+              <option value="graveyard">Graveyard setup / recursion</option>
+              <option value="interaction">Interaction / tempo</option>
+              <option value="threat">A proactive threat</option>
+              <option value="mana">Mana / devotion</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Search posture</span>
+            <select id="briefScope">
+              <option value="conservative">Conservative — closest role</option>
+              <option value="balanced" selected>Balanced — role plus upside</option>
+              <option value="exploratory">Exploratory — stretch the shell</option>
+            </select>
+          </label>
+          <fieldset class="brief-constraints">
+            <legend>Hard constraints</legend>
+            <label><input id="briefSameType" type="checkbox" /> Same primary type</label>
+            <label><input id="briefSameMana" type="checkbox" /> Same mana value</label>
+            <label><input id="briefSpellDensity" type="checkbox" checked /> Preserve spell density</label>
+          </fieldset>
+        </div>
+      </section>
+
       <section class="lab-ai-connect" aria-label="Deckbuilding review connection">
         <div>
           <p class="eyebrow">OPTIONAL DECKBUILDER REVIEW</p>
@@ -64,6 +105,7 @@
           </div>
         </div>
         <div class="lab-method" id="labMethod"></div>
+        <div class="brief-result" id="briefResult"></div>
         <p class="ai-review-note" id="aiReviewNote"></p>
         <div class="alternative-grid" id="alternativeGrid"></div>
       </section>
