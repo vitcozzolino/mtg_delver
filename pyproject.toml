@@ -7,11 +7,13 @@ requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "playwright>=1.63.0",
+    "PyJWT[crypto]>=2.11.0",
     "requests>=2.34.2",
+    "watchfiles>=1.1.1",
 ]
 
 [project.scripts]
-delver = "server:main"
+delver = "dev:main"
 load-mtgdecks = "loaders.runner:mtgdecks"
 load-aetherhub = "loaders.runner:aetherhub"
 
@@ -20,5 +22,5 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["server"]
+py-modules = ["server", "dev"]
 packages = ["loaders"]

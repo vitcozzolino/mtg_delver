@@ -158,7 +158,7 @@ function formatGeneratedAt(timestamp) {
 }
 function buildLiveDatasets(feed) {
   const grouped = {};
-  feed.events.flatMap(event => event.decks.map(deck => ({ ...deck, event }))).forEach(record => {
+  feed.events.flatMap(feedEvent => feedEvent.decks.map(deck => ({ ...deck, feedEvent }))).forEach(record => {
     if (!record.deck_text || !record.archetype || /^(unknown|ur|ub|wg|wubg|brg|g|b)$/i.test(record.archetype)) return;
     const cards = parseMainboard(record.deck_text);
     if (!Object.keys(cards).length) return;
@@ -167,13 +167,13 @@ function buildLiveDatasets(feed) {
     grouped[archetype] ??= { note: '', source: 'MTGO / Videre Project feed', sourceUrl: PUBLIC_FEED_URL, decks: [] };
     grouped[archetype].decks.push({
       name: `${record.player} — ${record.result || 'published list'}`,
-      event: record.event,
+      event: typeof record.event === 'string' ? record.event : record.feedEvent.title,
       finish: record.result || 'Published list',
       date: record.date,
       ageDays,
       cards,
       player: record.player,
-      sourceUrl: record.source_url || record.event.url,
+      sourceUrl: record.source_url || record.feedEvent.url,
       historicalArchive: Boolean(record.historical_archive)
     });
   });
@@ -482,6 +482,24 @@ function hideCardPreview() {
 function cardLabel(name, className = '') {
   return `<span class="${className}" data-card-name="${name}" tabindex="0">${name}</span>`;
 }
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  }[character]));
+}
+function packageListRow({ deck, quantity }) {
+  const source = deck.sourceUrl
+    ? `<a class="package-source-link" href="${escapeHtml(deck.sourceUrl)}" target="_blank" rel="noreferrer">Source ↗</a>`
+    : '<span class="package-source-label">Local archive</span>';
+  return `<div class="package-list-row">
+    <span class="package-list-copies">${quantity}×</span>
+    <strong class="package-list-player">${escapeHtml(deck.player || deck.name)}</strong>
+    <span class="package-list-event">${escapeHtml(deck.event)}</span>
+    <span class="package-list-result">${escapeHtml(deck.finish)}</span>
+    <time datetime="${escapeHtml(deck.date)}">${escapeHtml(deck.date)}</time>
+    ${source}
+  </div>`;
+}
 function bindCardPreviews() {
   document.querySelectorAll('[data-card-name]').forEach(element => {
     element.addEventListener('pointerenter', event => showCardPreview(element.dataset.cardName, event));
@@ -501,6 +519,18 @@ function populateArchetypes(preferredArchetype) {
 function updateDeckChoices() {
   selectDeck.innerHTML = '';
   datasets[selectArchetype.value].decks.forEach((deck, index) => selectDeck.add(new Option(deck.name, index)));
+}
+function updateCardLabLink(analysis) {
+  const archetype = selectArchetype.value;
+  $('#cardLabLink').href = archetype ? `./card-lab.html?archetype=${encodeURIComponent(archetype)}` : './card-lab.html';
+  if (!analysis) return;
+  sessionStorage.setItem('delver-card-lab-baseline', JSON.stringify({
+    archetype,
+    deckName: analysis.base.name,
+    cards: Object.entries(analysis.base.cards)
+      .map(([name, quantity]) => ({ name, quantity }))
+      .sort((first, second) => first.name.localeCompare(second.name))
+  }));
 }
 function getAnalysis() {
   const data = datasets[selectArchetype.value];
@@ -544,7 +574,23 @@ function renderAnalysis(analysis) {
   $('#summaryGrid').innerHTML = [[analysis.decks.length,'sampled lists'],[analysis.core.length,'backbone cards'],[flexInBase,'flex slots in baseline'],[totalCards,'cards indexed']].map(([value,label])=>`<div class="stat"><div class="stat-value">${value}</div><div class="stat-label">${label}</div></div>`).join('');
   $('#coreCards').innerHTML = analysis.core.map(([name, info]) => `<span class="signal-card" data-card-name="${name}" tabindex="0">${name}<b>${info.appearances}/${analysis.decks.length}</b></span>`).join('') || '<p>No shared nonland cards in the current sample.</p>';
   const packageGroups = analysis.variants.sort((a,b)=>b[1].appearances-a[1].appearances).slice(0,4);
-  $('#packages').innerHTML = packageGroups.map(([name,info]) => `<div class="package"><div class="package-name">${cardLabel(name)} <span class="signal-card flex"><b>${info.appearances}/${analysis.decks.length}</b></span></div><p class="package-info">${info.byDeck.map(({deck,quantity})=>`${quantity}× in ${deck.name}`).join(' · ')}</p></div>`).join('') || '<p class="package-info">The sample has no meaningful variant packages yet.</p>';
+  $('#packages').innerHTML = packageGroups.map(([name, info]) => {
+    const lists = [...info.byDeck]
+      .sort((first, second) => second.deck.date.localeCompare(first.deck.date) || first.deck.name.localeCompare(second.deck.name));
+    return `<details class="package">
+      <summary class="package-summary">
+        <span class="package-title">
+          ${cardLabel(name, 'package-card-name')}
+          <span class="package-prevalence">${info.appearances}<span>/ ${analysis.decks.length}</span></span>
+        </span>
+        <span class="package-toggle">View ${info.appearances} list${info.appearances === 1 ? '' : 's'} <b aria-hidden="true">⌄</b></span>
+      </summary>
+      <div class="package-lists" aria-label="Lists using ${escapeHtml(name)}">
+        <div class="package-list-header" aria-hidden="true"><span>Copies</span><span>Pilot</span><span>Event</span><span>Result</span><span>Date</span><span></span></div>
+        ${lists.map(packageListRow).join('')}
+      </div>
+    </details>`;
+  }).join('') || '<p class="package-info">The sample has no meaningful variant packages yet.</p>';
 }
 function renderExperiments(analysis) {
   const baseCards = Object.keys(analysis.base.cards);
@@ -593,7 +639,7 @@ function renderExperiments(analysis) {
   });
   if (!experiments.length) target.innerHTML = '<p class="package-info">No role-compatible swaps are present in the sample. Add more source lists to broaden the search.</p>';
 }
-function render() { const analysis = getAnalysis(); renderDeck(analysis); renderAnalysis(analysis); renderExperiments(analysis); bindCardPreviews(); }
+function render() { const analysis = getAnalysis(); updateCardLabLink(analysis); renderDeck(analysis); renderAnalysis(analysis); renderExperiments(analysis); bindCardPreviews(); }
 selectArchetype.addEventListener('change', async () => {
   updateDeckChoices();
   try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }

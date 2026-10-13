@@ -24,6 +24,14 @@ For the selected archetype, Delver also loads capped, cached supplemental lists 
 
 MTGTop8 is deliberately a small, cache-first supplement rather than a bulk crawler: Delver loads the selected Pioneer archetype only, requests no more than the selected **per-source cap** (5, 10, or 20) of individual deck pages, waits between those requests, and retains the result locally for six hours. Its archetype labels are mapped conservatively (for example, MTGTop8's **Arclight Phoenix** maps to Delver's **Izzet Phoenix**); an unmatched label is skipped rather than mixed into the wrong shell.
 
+## Card Lab
+
+Use **Card Lab** in the top navigation to research replacements for a Pioneer-legal card inside a specific archetype. It first applies hard filters: candidates must be Pioneer legal, color-compatible, close on the curve, and preserve a non-generic functional role (such as selection, removal, graveyard setup, or countermagic). For example, a removal spell cannot pass as an Opt replacement merely because both are instants.
+
+When Card Lab is opened from the Deck Explorer, it carries the selected baseline mainboard across: its existing cards are excluded from suggestions and supplied as deck context. Click **Continue with ChatGPT** in Card Lab to connect an eligible ChatGPT plan through OpenAI's local OAuth flow. The local server keeps the resulting credentials in a gitignored owner-only file; browser JavaScript only receives connection status, never a token. After connecting, Card Lab loads the models actually available to that account and lets you select the review model. It then reviews only the bounded candidate set and returns structured recommend/situational/reject decisions with a concise deckbuilding rationale.
+
+If you prefer API billing, `OPENAI_API_KEY` remains an optional fallback. Plan-backed reviews take priority when connected. Reviews are cached locally for seven days; heuristic candidates are cached for one day. If neither credential path is available, the page stays usable and visibly labels the results as heuristic-only.
+
 ## Import saved MTGDecks pages
 
 The **Import saved HTML** control reads saved `.html` deck pages directly in the browser. It never sends those files anywhere and does not make a request to MTGDecks. Save one or more individual decklist pages in your browser, choose them together, and they become a local-only supplement to the relevant archetype for the current session.
@@ -77,7 +85,7 @@ After that, starting the Python backend needs no export or key entry:
 uv run delver
 ```
 
-Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. The recency slider uses 1–90 days. The UI visibly credits the active data source. The key remains local for optional TopDeck support, but the default Pioneer sample is now Videre + Spicerack because TopDeck currently exposes too few public Pioneer decklists.
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. `uv run delver` watches Python, HTML, CSS, JavaScript, and `pyproject.toml`, restarting the local server whenever they change; caches and loader output are ignored. The recency slider uses 1–90 days. The UI visibly credits the active data source. The key remains local for optional TopDeck support, but the default Pioneer sample is now Videre + Spicerack because TopDeck currently exposes too few public Pioneer decklists.
 
 The frontend remains plain HTML, CSS, and JavaScript. Python is only the local API server that keeps the TopDeck key out of the browser. `uv` creates an isolated `.venv` and locks the project in `uv.lock`; the optional local loaders use `requests`, Beautiful Soup, and Playwright. TopDeck only contributes completed events with public decklists; when it has no usable Pioneer lists, the UI visibly falls back to the public MTGO feed. Never commit a real key; `.env.example` is only a naming reference.
 

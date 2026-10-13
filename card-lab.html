@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Pioneer card alternative research" />
+    <title>Card Lab — Delver</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Fraunces:opsz,wght@9..144,600;9..144,700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="card-lab-page">
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="./index.html">delver<span>_</span></a>
+        <div class="format-pill"><span class="status-dot"></span> Pioneer Card Lab</div>
+        <a class="ghost-button" href="./index.html">Deck Explorer</a>
+      </header>
+
+      <section class="lab-hero">
+        <p class="eyebrow">FUNCTIONAL REPLACEMENT RESEARCH</p>
+        <h1>Find a replacement<br /><em>without losing the plan.</em></h1>
+        <p>Start with a Pioneer-legal card. Card Lab looks for functional overlap, then scores each option against the archetype’s colors, curve, strategy, and win plan.</p>
+      </section>
+
+      <form id="cardLabForm" class="lab-controls">
+        <label class="field">
+          <span>Archetype</span>
+          <select id="labArchetype" name="archetype"></select>
+        </label>
+        <label class="field">
+          <span>Card to replace</span>
+          <input id="labCard" name="card" list="labCardExamples" placeholder="e.g. Treasure Cruise" autocomplete="off" required />
+          <datalist id="labCardExamples"></datalist>
+        </label>
+        <button class="primary-button" type="submit">Find alternatives <span>→</span></button>
+      </form>
+
+      <section class="lab-ai-connect" aria-label="Deckbuilding review connection">
+        <div>
+          <p class="eyebrow">OPTIONAL DECKBUILDER REVIEW</p>
+          <p id="chatgptConnection">Heuristic scoring is ready. Connect ChatGPT to add a plan-backed second opinion.</p>
+          <label class="chatgpt-model" id="chatgptModelWrap" hidden>Review model <select id="chatgptModel" aria-label="ChatGPT review model"></select></label>
+        </div>
+        <button class="chatgpt-button" id="connectChatGPT" type="button">Continue with ChatGPT</button>
+      </section>
+
+      <p class="baseline-context" id="baselineContext">Open Card Lab from the Deck Explorer to use its selected mainboard as the replacement context.</p>
+
+      <p class="lab-status" id="labStatus" role="status" aria-live="polite">Choose an archetype and card to begin.</p>
+
+      <section id="labResults" class="lab-results" hidden>
+        <div class="lab-context">
+          <div>
+            <p class="eyebrow">THE REPLACEMENT TARGET</p>
+            <h2 id="sourceCardName">—</h2>
+            <p id="sourceCardMeta"></p>
+          </div>
+          <div class="plan-box">
+            <p class="eyebrow">ARCHETYPE PLAN</p>
+            <strong id="strategyName">—</strong>
+            <p id="winPlan">—</p>
+          </div>
+        </div>
+        <div class="lab-method" id="labMethod"></div>
+        <p class="ai-review-note" id="aiReviewNote"></p>
+        <div class="alternative-grid" id="alternativeGrid"></div>
+      </section>
+    </main>
+    <aside id="cardPreview" class="card-preview" aria-live="polite" aria-hidden="true">
+      <div class="preview-loading">Loading card…</div>
+    </aside>
+    <script src="./card-lab.js"></script>
+  </body>
+</html>

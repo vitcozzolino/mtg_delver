@@ -6,21 +6,30 @@ browser and is only sent to TopDeck's API in the Authorization request.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import secrets
 import sqlite3
+import tempfile
+import threading
 import time
+import uuid
 import zipfile
+from hashlib import sha256
 from errno import EADDRINUSE
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from html import unescape
+from html import escape, unescape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
+
+import jwt
+import requests
 
 
 ROOT = Path(__file__).parent
@@ -36,6 +45,18 @@ CACHE_DB = ROOT / "delver-cache.sqlite3"
 SOURCE_CACHE_TTL_SECONDS = 30 * 60
 ARCHETYPE_CACHE_TTL_SECONDS = 6 * 60 * 60
 CARD_PROFILE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+CARD_ALTERNATIVE_CACHE_TTL_SECONDS = 24 * 60 * 60
+CARD_LAB_REVIEW_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+OPENAI_CARD_LAB_MODEL = "gpt-5.6-terra"
+OPENAI_AUTH_AUTHORIZE_URL = "https://auth.openai.com/api/accounts/authorize"
+OPENAI_AUTH_TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token"
+OPENAI_AUTH_JWKS_URL = "https://auth.openai.com/.well-known/jwks.json"
+OPENAI_CHATGPT_RESOURCE = "https://api.openai.com/v1"
+OPENAI_CHATGPT_SCOPES = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+OPENAI_DYNAMIC_CLIENT_ID = "dynamic_agent_client"
+CHATGPT_AUTH_STORE = ROOT / ".delver-chatgpt-auth.json"
+CHATGPT_REDIRECT_URI = "http://127.0.0.1:8080/api/chatgpt/callback"
 MAX_ARCHETYPE_DECKS = 20
 LOCAL_DECK_ARCHIVE = ROOT / "output" / "mtgdecks" / "decklists.zip"
 # MTGTop8 does not publish an API or rate-limit guidance. Keep every live
@@ -54,6 +75,55 @@ MTG_TOP8_ARCHETYPE_ALIASES = {
 }
 
 
+CARD_LAB_ARCHETYPES = {
+    "Izzet Phoenix": {
+        "colors": "UR",
+        "strategy": "Spell-density graveyard tempo",
+        "win_plan": "Fill the graveyard, chain cheap spells, and recur Arclight Phoenix while protecting the tempo lead.",
+        "priorities": {"spell", "selection", "graveyard", "recursion", "tempo", "threat"},
+    },
+    "Azorius Control": {
+        "colors": "WU",
+        "strategy": "Reactive control",
+        "win_plan": "Trade efficiently, protect card advantage, then close with a resilient planeswalker or land threat.",
+        "priorities": {"countermagic", "removal", "selection", "sweeper", "threat"},
+    },
+    "Mono-Green Devotion": {
+        "colors": "G",
+        "strategy": "Devotion ramp",
+        "win_plan": "Accelerate mana and devotion, then overwhelm the board with oversized permanents and Nykthos turns.",
+        "priorities": {"ramp", "devotion", "threat", "selection"},
+    },
+    "Greasefang": {
+        "colors": "WB",
+        "strategy": "Graveyard vehicle combo",
+        "win_plan": "Put Parhelion II in the graveyard, return it with Greasefang, and attack before the opponent can stabilize.",
+        "priorities": {"graveyard", "recursion", "selection", "threat"},
+    },
+    "Lotus Field": {
+        "colors": "U",
+        "strategy": "Land-combo mana engine",
+        "win_plan": "Assemble Lotus Field mana, untap it repeatedly, and convert the mana burst into a deterministic finish.",
+        "priorities": {"ramp", "selection", "spell"},
+    },
+}
+
+# These labels describe broad card classes, not a job a replacement needs to
+# preserve. A one-mana burn spell and Opt are both "spells", but that does not
+# make the burn spell an Opt replacement.
+CARD_LAB_GENERIC_ROLES = {"spell", "land"}
+CARD_LAB_FUNCTIONAL_ROLES = {
+    "selection", "graveyard", "recursion", "countermagic", "removal",
+    "burn", "sweeper", "ramp", "devotion", "tempo",
+}
+
+# OAuth transactions are deliberately short-lived and only held in memory.
+# Tokens themselves are stored in a local 0600 file and never cross the API
+# boundary to the browser.
+CHATGPT_AUTH_PENDING: dict[str, dict] = {}
+CHATGPT_AUTH_LOCK = threading.Lock()
+
+
 def load_local_env() -> None:
     """Load the project's local .env without adding a third-party dependency."""
     env_file = ROOT / ".env"
@@ -70,6 +140,259 @@ def load_local_env() -> None:
 
 
 load_local_env()
+
+
+def load_chatgpt_auth_store() -> dict:
+    """Load local OAuth credentials without ever exposing them over HTTP."""
+    try:
+        payload = json.loads(CHATGPT_AUTH_STORE.read_text())
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_chatgpt_auth_store(payload: dict) -> None:
+    """Atomically persist OAuth credentials with owner-only permissions."""
+    CHATGPT_AUTH_STORE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=CHATGPT_AUTH_STORE.parent,
+            prefix=".delver-chatgpt-", suffix=".tmp", delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            os.chmod(temporary_path, 0o600)
+            json.dump(payload, temporary_file, sort_keys=True)
+            temporary_file.write("\n")
+        os.replace(temporary_path, CHATGPT_AUTH_STORE)
+        os.chmod(CHATGPT_AUTH_STORE, 0o600)
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+
+
+def chatgpt_host_id() -> str:
+    with CHATGPT_AUTH_LOCK:
+        stored = load_chatgpt_auth_store()
+        host_id = stored.get("ext_agent_host_id")
+        if isinstance(host_id, str) and re.fullmatch(r"urn:uuid:[0-9a-fA-F-]{36}", host_id):
+            return host_id
+        # OpenAI requires a URI-form host identifier, not a bare UUID.
+        host_id = f"urn:uuid:{uuid.uuid4()}"
+        save_chatgpt_auth_store({"ext_agent_host_id": host_id})
+        return host_id
+
+
+def urlsafe_sha256(value: str) -> str:
+    return base64.urlsafe_b64encode(sha256(value.encode()).digest()).decode().rstrip("=")
+
+
+def chatgpt_connection_status() -> dict:
+    """Return only safe connection metadata for the local Card Lab UI."""
+    stored = load_chatgpt_auth_store()
+    account = stored.get("account")
+    if not isinstance(account, dict) or not isinstance(account.get("refresh_token"), str):
+        return {"connected": False, "provider": "chatgpt_plan"}
+    email = account.get("email")
+    return {
+        "connected": True,
+        "provider": "chatgpt_plan",
+        "account": email if isinstance(email, str) and email else None,
+        "preferred_model": os.environ.get("OPENAI_MODEL", OPENAI_CARD_LAB_MODEL),
+    }
+
+
+def begin_chatgpt_sign_in() -> dict:
+    """Create a PKCE-protected OpenAI OAuth authorization URL."""
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    with CHATGPT_AUTH_LOCK:
+        stored = load_chatgpt_auth_store()
+        account = stored.get("account") if isinstance(stored.get("account"), dict) else {}
+        issued_client_id = account.get("client_id") if isinstance(account.get("client_id"), str) else None
+        client_id = issued_client_id or OPENAI_DYNAMIC_CLIENT_ID
+        CHATGPT_AUTH_PENDING[state] = {
+            "nonce": nonce,
+            "verifier": verifier,
+            "client_id": client_id,
+            "is_new_registration": issued_client_id is None,
+            "created_at": time.time(),
+        }
+        # Keep at most ten short-lived transactions. States expire after ten
+        # minutes, so a stale browser tab cannot become a long-lived secret.
+        stale_states = [key for key, value in CHATGPT_AUTH_PENDING.items() if value["created_at"] < time.time() - 600]
+        for stale_state in stale_states:
+            CHATGPT_AUTH_PENDING.pop(stale_state, None)
+    parameters = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": CHATGPT_REDIRECT_URI,
+        "scope": OPENAI_CHATGPT_SCOPES,
+        "resource": OPENAI_CHATGPT_RESOURCE,
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": urlsafe_sha256(verifier),
+        "code_challenge_method": "S256",
+        "ext_agent_host_id": chatgpt_host_id(),
+    }
+    if issued_client_id is None:
+        parameters["agent_name_hint"] = "Delver"
+    else:
+        if isinstance(account.get("id_token"), str):
+            parameters["id_token_hint"] = account["id_token"]
+        if isinstance(account.get("email"), str):
+            parameters["login_hint"] = account["email"]
+    return {"authorize_url": f"{OPENAI_AUTH_AUTHORIZE_URL}?{urlencode(parameters)}"}
+
+
+def request_chatgpt_token(parameters: dict[str, str]) -> dict:
+    encoded = urlencode(parameters).encode()
+    response = fetch_json(
+        OPENAI_AUTH_TOKEN_URL,
+        timeout=30,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=encoded,
+    )
+    if not isinstance(response, dict) or not isinstance(response.get("access_token"), str):
+        raise RuntimeError("ChatGPT did not return a usable access token")
+    return response
+
+
+def validate_chatgpt_id_token(id_token: str, *, client_id: str, nonce: str) -> dict:
+    """Validate signature, issuer, audience, expiry, and nonce for OpenAI OAuth."""
+    try:
+        algorithm = jwt.get_unverified_header(id_token).get("alg")
+        if algorithm not in {"RS256", "ES256"}:
+            raise RuntimeError("ChatGPT sign-in used an unsupported token algorithm")
+        jwk_client = jwt.PyJWKClient(OPENAI_AUTH_JWKS_URL)
+        signing_key = jwk_client.get_signing_key_from_jwt(id_token)
+        claims = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=[algorithm],
+            audience=client_id,
+            issuer="https://auth.openai.com",
+        )
+    except (jwt.PyJWTError, RuntimeError) as error:
+        raise RuntimeError("ChatGPT sign-in token validation failed") from error
+    if claims.get("nonce") != nonce:
+        raise RuntimeError("ChatGPT sign-in nonce did not match")
+    return claims if isinstance(claims, dict) else {}
+
+
+def complete_chatgpt_sign_in(query: dict[str, list[str]]) -> dict:
+    error = query.get("error", [""])[0]
+    if error:
+        description = query.get("error_description", [""])[0]
+        raise RuntimeError(description or f"ChatGPT sign-in was declined ({error})")
+    state = query.get("state", [""])[0]
+    code = query.get("code", [""])[0]
+    if not state or not code:
+        raise RuntimeError("ChatGPT sign-in did not return an authorization code")
+    with CHATGPT_AUTH_LOCK:
+        transaction = CHATGPT_AUTH_PENDING.pop(state, None)
+    if not transaction or transaction["created_at"] < time.time() - 600:
+        raise RuntimeError("ChatGPT sign-in expired. Return to Card Lab and try again.")
+    callback_client_id = query.get("client_id", [""])[0]
+    if transaction["is_new_registration"]:
+        if not callback_client_id or callback_client_id == OPENAI_DYNAMIC_CLIENT_ID:
+            raise RuntimeError("ChatGPT registration did not return an issued client ID")
+        issued_client_id = callback_client_id
+    else:
+        if callback_client_id and callback_client_id != transaction["client_id"]:
+            raise RuntimeError("ChatGPT sign-in returned a different client ID")
+        issued_client_id = transaction["client_id"]
+    token_payload = request_chatgpt_token({
+        "grant_type": "authorization_code",
+        "client_id": issued_client_id,
+        "code": code,
+        "code_verifier": transaction["verifier"],
+        "redirect_uri": CHATGPT_REDIRECT_URI,
+        "resource": OPENAI_CHATGPT_RESOURCE,
+    })
+    id_token = token_payload.get("id_token")
+    scope = str(token_payload.get("scope") or "")
+    if not isinstance(id_token, str):
+        raise RuntimeError("ChatGPT sign-in did not issue complete credentials")
+    claims = validate_chatgpt_id_token(id_token, client_id=issued_client_id, nonce=transaction["nonce"])
+    granted_scopes = set(scope.split())
+    if "chatgpt.tokens.use.direct" not in granted_scopes:
+        raise RuntimeError("This ChatGPT account is not enabled for direct plan-token use")
+    expires_in = token_payload.get("expires_in")
+    expires_at = time.time() + int(expires_in) if isinstance(expires_in, (int, float, str)) and str(expires_in).isdigit() else time.time() + 300
+    account = {
+        "client_id": issued_client_id,
+        "access_token": token_payload["access_token"],
+        "refresh_token": token_payload.get("refresh_token"),
+        "id_token": id_token,
+        "expires_at": expires_at,
+        "scope": scope,
+        "email": claims.get("email") if isinstance(claims.get("email"), str) else None,
+    }
+    if not isinstance(account["refresh_token"], str):
+        raise RuntimeError("ChatGPT sign-in did not return a refresh token")
+    with CHATGPT_AUTH_LOCK:
+        stored = load_chatgpt_auth_store()
+        stored["account"] = account
+        save_chatgpt_auth_store(stored)
+    return chatgpt_connection_status()
+
+
+def chatgpt_plan_access_token() -> str | None:
+    """Return a valid plan access token, refreshing it locally when needed."""
+    with CHATGPT_AUTH_LOCK:
+        stored = load_chatgpt_auth_store()
+        account = stored.get("account")
+        if not isinstance(account, dict):
+            return None
+        token = account.get("access_token")
+        expires_at = account.get("expires_at")
+        if isinstance(token, str) and isinstance(expires_at, (int, float)) and expires_at > time.time() + 120:
+            return token
+        refresh_token = account.get("refresh_token")
+        client_id = account.get("client_id")
+        if not isinstance(refresh_token, str) or not isinstance(client_id, str):
+            return None
+        token_payload = request_chatgpt_token({
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "resource": OPENAI_CHATGPT_RESOURCE,
+        })
+        account["access_token"] = token_payload["access_token"]
+        if isinstance(token_payload.get("refresh_token"), str):
+            account["refresh_token"] = token_payload["refresh_token"]
+        expires_in = token_payload.get("expires_in")
+        account["expires_at"] = time.time() + int(expires_in) if isinstance(expires_in, (int, float, str)) and str(expires_in).isdigit() else time.time() + 300
+        stored["account"] = account
+        save_chatgpt_auth_store(stored)
+        return account["access_token"]
+
+
+def chatgpt_plan_models() -> list[dict[str, str]]:
+    """Return the signed-in account's visible model catalog, never cached globally."""
+    token = chatgpt_plan_access_token()
+    if not token:
+        raise RuntimeError("Connect ChatGPT before loading the plan model catalog")
+    response = fetch_json(
+        "https://api.openai.com/v1/models",
+        timeout=30,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    raw_models = response.get("models") if isinstance(response, dict) else None
+    if not isinstance(raw_models, list):
+        raise RuntimeError("ChatGPT did not return a usable model catalog")
+    models = []
+    for model in raw_models:
+        if not isinstance(model, dict) or model.get("visibility") != "list":
+            continue
+        slug, display_name = model.get("slug"), model.get("display_name")
+        if isinstance(slug, str) and slug and isinstance(display_name, str) and display_name:
+            models.append({"slug": slug, "display_name": display_name})
+    if not models:
+        raise RuntimeError("This ChatGPT account has no models available for Card Lab")
+    return models
 
 
 def initialize_cache() -> None:
@@ -191,6 +514,92 @@ def fetch_json(
         raise RuntimeError(f"Source returned HTTP {error.code}: {detail}") from error
     except URLError as error:
         raise RuntimeError(f"Could not reach source: {error.reason}") from error
+
+
+def fetch_response_text_streaming(request_payload: dict, access_token: str) -> str:
+    """Consume the Responses SSE stream required for ChatGPT plan tokens."""
+    headers = {
+        "Accept": "text/event-stream",
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "mtg-delver/0.1 (+https://github.com/vitcozzolino/mtg_delver)",
+    }
+    deltas: list[str] = []
+    completed = False
+    seen_types: list[str] = []
+
+    def consume_event(event: object) -> None:
+        nonlocal completed
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        if isinstance(event_type, str):
+            seen_types.append(event_type)
+        if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
+            deltas.append(event["delta"])
+        elif event_type in {"response.completed", "response.done"}:
+            completed = True
+            if not deltas and isinstance(event.get("response"), dict):
+                completed_text = output_text_from_response(event["response"])
+                if completed_text:
+                    deltas.append(completed_text)
+        elif event_type in {"response.failed", "response.incomplete", "error"}:
+            response_data = event.get("response") if isinstance(event.get("response"), dict) else {}
+            error = response_data.get("error") or event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            if event_type == "response.incomplete" and not message:
+                details = response_data.get("incomplete_details")
+                reason = details.get("reason") if isinstance(details, dict) else None
+                message = f"ChatGPT plan review was incomplete ({reason or 'unknown reason'})"
+            raise RuntimeError(message or "ChatGPT plan review did not complete")
+
+    try:
+        with requests.post(
+            OPENAI_RESPONSES_URL, headers=headers, json=request_payload,
+            stream=True, timeout=(15, 45),
+        ) as response:
+            if not response.ok:
+                raise RuntimeError(f"ChatGPT plan returned HTTP {response.status_code}: {response.text[:300]}")
+            # Accept a completed JSON response as well as the normal SSE
+            # response. requests handles stream encoding/decompression safely.
+            if "application/json" in response.headers.get("Content-Type", ""):
+                completed_response = response.json()
+                if not isinstance(completed_response, dict):
+                    raise RuntimeError("ChatGPT plan returned an invalid completed response")
+                if isinstance(completed_response.get("error"), dict):
+                    raise RuntimeError(completed_response["error"].get("message") or "ChatGPT plan review failed")
+                completed = True
+                completed_text = output_text_from_response(completed_response)
+                if completed_text:
+                    deltas.append(completed_text)
+            else:
+                data_lines: list[str] = []
+                for line in response.iter_lines(decode_unicode=True):
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    if not line:
+                        if data_lines:
+                            data = "\n".join(data_lines)
+                            data_lines = []
+                            if data != "[DONE]":
+                                try:
+                                    consume_event(json.loads(data))
+                                except json.JSONDecodeError:
+                                    continue
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                if data_lines:
+                    try:
+                        consume_event(json.loads("\n".join(data_lines)))
+                    except json.JSONDecodeError:
+                        pass
+    except requests.RequestException as error:
+        raise RuntimeError(f"Could not reach ChatGPT plan inference: {error}") from error
+    if not completed:
+        observed = ", ".join(dict.fromkeys(seen_types)) or "no readable stream events"
+        raise RuntimeError(f"ChatGPT plan stream ended before completion ({observed})")
+    return "".join(deltas)
 
 
 def fetch_html(url: str, timeout: int = 20) -> str:
@@ -376,6 +785,420 @@ def fetch_card_profiles(names: list[str]) -> dict[str, dict]:
         )
     cached.update(profiles_to_store)
     return cached
+
+
+def card_lab_primary_type(type_line: str) -> str:
+    lowered = type_line.casefold()
+    for card_type in ("land", "creature", "planeswalker", "artifact", "enchantment", "instant", "sorcery"):
+        if card_type in lowered:
+            return card_type
+    return "other"
+
+
+def card_lab_roles(type_line: str, oracle_text: str) -> set[str]:
+    """Map rules text to compact, explainable deckbuilding roles."""
+    text = oracle_text.casefold()
+    card_type = card_lab_primary_type(type_line)
+    roles: set[str] = set()
+    if card_type in {"instant", "sorcery"}:
+        roles.add("spell")
+    if card_type in {"creature", "planeswalker"}:
+        roles.add("threat")
+    if card_type == "land":
+        roles.add("land")
+    if re.search(r"draw (?:a|two|three|four)|surveil|connive|scry|look at the top", text):
+        roles.add("selection")
+    if re.search(r"mill|discard|from your graveyard|delve|escape|return .*graveyard", text):
+        roles.add("graveyard")
+    if re.search(r"return .*graveyard.*battlefield|return .*graveyard.*hand|escape", text):
+        roles.add("recursion")
+    if re.search(r"counter target|spells? can't be countered", text):
+        roles.add("countermagic")
+    if re.search(r"destroy target|exile target|deals? \d+ damage to target|fight target", text):
+        roles.add("removal")
+    if re.search(r"deals? \d+ damage to any target|deals? \d+ damage to each", text):
+        roles.add("burn")
+    if re.search(r"destroy all|exile all|each creature gets -", text):
+        roles.add("sweeper")
+    if re.search(r"add \{|search your library for a basic land|create a treasure", text):
+        roles.add("ramp")
+    if re.search(r"devotion", text):
+        roles.add("devotion")
+    if re.search(r"tap target|return target.*owner.?s hand|can.?t attack|can.?t block", text):
+        roles.add("tempo")
+    return roles
+
+
+def card_lab_required_roles(source_roles: set[str]) -> set[str]:
+    """Return the actual job that needs preserving in a swap.
+
+    Generic labels such as ``spell`` are deliberately excluded. This prevents
+    false equivalences such as offering a colour-hosing removal spell in place
+    of a cantrip simply because both happen to be instants.
+    """
+    return source_roles & CARD_LAB_FUNCTIONAL_ROLES
+
+
+def card_lab_is_narrow_removal(card: dict) -> bool:
+    """Flag removal limited by a colour, tribe, or similarly narrow condition."""
+    text = str(card.get("oracle_text") or "").casefold()
+    return bool(re.search(
+        r"\b(?:white|blue|black|red|green)(?:\s+or\s+(?:white|blue|black|red|green))*\s+"
+        r"(?:creature|permanent)\b|\b(?:multicolored|monocolored|artifact|enchantment|"
+        r"legendary|token)\s+(?:creature|permanent)\b|\b(?:creature|permanent) with\b",
+        text,
+    ))
+
+
+def card_lab_card(card: object) -> dict | None:
+    if not isinstance(card, dict) or not isinstance(card.get("name"), str):
+        return None
+    legalities = card.get("legalities")
+    if not isinstance(legalities, dict) or legalities.get("pioneer") != "legal":
+        return None
+    type_line = str(card.get("type_line") or "")
+    oracle_text = str(card.get("oracle_text") or "")
+    colors = "".join(card.get("color_identity") or [])
+    mana_value = card.get("cmc") if isinstance(card.get("cmc"), (int, float)) else 0
+    effective_mana_value = max(1, mana_value - 6) if "delve" in oracle_text.casefold() else mana_value
+    return {
+        "name": card["name"],
+        "type_line": type_line,
+        "oracle_text": oracle_text,
+        "mana_value": mana_value,
+        "effective_mana_value": effective_mana_value,
+        "colors": colors,
+        "roles": sorted(card_lab_roles(type_line, oracle_text)),
+        "scryfall_uri": card.get("scryfall_uri") or "",
+        "image_uri": (card.get("image_uris") or {}).get("normal") if isinstance(card.get("image_uris"), dict) else "",
+    }
+
+
+def card_lab_query(card_type: str, colors: str, source_roles: set[str]) -> str:
+    type_query = {
+        "instant": "t:instant",
+        "sorcery": "t:sorcery",
+        "creature": "t:creature",
+        "planeswalker": "t:planeswalker",
+        "artifact": "t:artifact",
+        "enchantment": "t:enchantment",
+        "land": "t:land",
+    }.get(card_type, "")
+    color_query = f"ci<={colors}" if colors else ""
+    role_query = ""
+    if "selection" in source_roles:
+        role_query = "o:draw"
+    elif "countermagic" in source_roles:
+        role_query = "o:counter"
+    elif "removal" in source_roles:
+        role_query = "o:target"
+    return " ".join(part for part in ("f:pioneer", color_query, type_query, role_query) if part)
+
+
+def card_lab_score(source: dict, candidate: dict, plan: dict) -> tuple[int, list[str], list[str]]:
+    source_roles = set(source["roles"])
+    candidate_roles = set(candidate["roles"])
+    shared_roles = sorted((source_roles & candidate_roles) - CARD_LAB_GENERIC_ROLES)
+    plan_roles = sorted(candidate_roles & set(plan["priorities"]))
+    mana_delta = abs(float(source["effective_mana_value"]) - float(candidate["effective_mana_value"]))
+    score = 28 if card_lab_primary_type(source["type_line"]) == card_lab_primary_type(candidate["type_line"]) else 0
+    score += len(shared_roles) * 20
+    score += len(plan_roles) * 9
+    score += 12 if mana_delta <= 1 else 0
+    score -= int(mana_delta * 10)
+    if candidate["name"].casefold() == source["name"].casefold():
+        return -1_000, shared_roles, plan_roles
+    if "removal" in source_roles and not card_lab_is_narrow_removal(source) and card_lab_is_narrow_removal(candidate):
+        score -= 28
+    return score, shared_roles, plan_roles
+
+
+def fetch_card_alternatives(
+    card_name: str,
+    archetype: str,
+    *,
+    excluded_cards: set[str] | None = None,
+    mainboard: list[dict] | None = None,
+    review_model: str | None = None,
+    force_refresh: bool = False,
+) -> dict:
+    plan = CARD_LAB_ARCHETYPES.get(archetype)
+    if not plan:
+        raise RuntimeError(f"Card Lab does not have a strategy profile for {archetype} yet")
+    cache_key = f"card-lab:v2:{archetype_slug(archetype)}:{card_name.casefold()}"
+    payload = cached_fetch(
+        cache_key,
+        CARD_ALTERNATIVE_CACHE_TTL_SECONDS,
+        lambda: fetch_card_alternatives_live(card_name, archetype, plan),
+        force_refresh=force_refresh,
+    )
+    excluded = {name.casefold() for name in (excluded_cards or set())}
+    filtered_payload = payload
+    # The candidate pool is safely cached, while this presentation-level
+    # filter remains specific to the baseline deck that opened Card Lab.
+    if excluded:
+        filtered_payload = {
+            **payload,
+            "alternatives": [
+                candidate for candidate in payload.get("alternatives", [])
+                if str(candidate.get("name") or "").casefold() not in excluded
+            ],
+            "excluded_cards": len(excluded),
+        }
+    return review_card_alternatives_with_llm(
+        filtered_payload,
+        mainboard=mainboard or [],
+        review_model=review_model,
+        force_refresh=force_refresh,
+    )
+
+
+def card_lab_mainboard_lines(mainboard: list[dict]) -> list[str]:
+    """Validate the browser-provided local deck context before prompting."""
+    lines: list[str] = []
+    for entry in mainboard[:120]:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        quantity = entry.get("quantity")
+        if not name or not isinstance(quantity, int) or not 1 <= quantity <= 20:
+            continue
+        lines.append(f"{quantity}x {name}")
+    return lines
+
+
+def card_lab_review_schema() -> dict:
+    return {
+        "type": "json_schema",
+        "name": "pioneer_card_lab_review",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "reviews": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "verdict": {"type": "string", "enum": ["recommended", "situational", "reject"]},
+                            "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "rationale": {"type": "string"},
+                            "cautions": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["name", "verdict", "score", "rationale", "cautions"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["reviews"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def card_lab_review_prompt(payload: dict, mainboard: list[dict]) -> str:
+    source = payload["source_card"]
+    # Review the strongest heuristic matches only. This keeps the structured
+    # response bounded and avoids making the user wait on a long plan request.
+    candidates = payload.get("alternatives", [])[:8]
+    return json.dumps({
+        "task": "Judge these possible Pioneer deck replacements. Return one review for every candidate supplied.",
+        "format": "Pioneer",
+        "archetype": payload["archetype"],
+        "strategy": payload["strategy"],
+        "win_plan": payload["win_plan"],
+        "baseline_mainboard": card_lab_mainboard_lines(mainboard),
+        "source_card": {
+            "name": source["name"], "type_line": source["type_line"],
+            "mana_value": source["mana_value"], "oracle_text": source["oracle_text"],
+            "detected_roles": source["roles"],
+        },
+        "candidates": [{
+            "name": card["name"], "type_line": card["type_line"],
+            "mana_value": card["mana_value"], "oracle_text": card["oracle_text"],
+            "roles": card["roles"],
+        } for card in candidates],
+        "rules": [
+            "Use only the candidates supplied; never invent another card.",
+            "Judge the actual role of the source card, not merely colour, card type, or mana value.",
+            "Reject a candidate that does not preserve the source card's important function in this deck.",
+            "Reject narrow hate cards as general replacements unless the baseline and matchup role clearly justify them.",
+            "For Izzet Phoenix, distinguish cantrips/graveyard velocity from removal, and preserve spell density only when the card also has the needed job.",
+            "Keep rationales concrete and short; name the strategic tradeoff where one exists.",
+        ],
+    })
+
+
+def output_text_from_response(response: object) -> str:
+    if not isinstance(response, dict):
+        return ""
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"]
+    for item in response.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content", []):
+            if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                return part["text"]
+    return ""
+
+
+def review_card_alternatives_with_llm(
+    payload: dict, *, mainboard: list[dict], review_model: str | None, force_refresh: bool,
+) -> dict:
+    """Ask a bounded deckbuilding reviewer, never to generate arbitrary cards."""
+    plan_error = ""
+    try:
+        chatgpt_token = chatgpt_plan_access_token()
+    except RuntimeError as error:
+        chatgpt_token = None
+        plan_error = str(error)
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if chatgpt_token:
+        credential = chatgpt_token
+        provider = "chatgpt_plan"
+        provider_label = "ChatGPT plan"
+    elif api_key:
+        credential = api_key
+        provider = "api_key"
+        provider_label = "OpenAI API"
+    else:
+        detail = plan_error or "Connect ChatGPT to enable a plan-backed deckbuilding review."
+        return {**payload, "ai_review": {"status": "unavailable", "detail": detail}}
+    candidates = payload.get("alternatives", [])
+    if not candidates:
+        return {**payload, "ai_review": {"status": "skipped", "detail": "No heuristic candidates to review."}}
+    context_fingerprint = sha256(json.dumps({
+        "mainboard": card_lab_mainboard_lines(mainboard),
+        "candidates": [card["name"] for card in candidates],
+        "source": payload["source_card"]["name"],
+        "archetype": payload["archetype"],
+        "model": review_model or os.environ.get("OPENAI_MODEL", OPENAI_CARD_LAB_MODEL),
+    }, sort_keys=True).encode()).hexdigest()[:20]
+    cache_key = f"card-lab:review:v2:{provider}:{context_fingerprint}"
+
+    def request_review() -> dict:
+        request_payload = {
+            "model": review_model or os.environ.get("OPENAI_MODEL", OPENAI_CARD_LAB_MODEL),
+            "instructions": "You are a precise competitive Magic: The Gathering Pioneer deckbuilder. Follow the supplied rules text and return only the requested JSON schema.",
+            # ChatGPT plan inference requires the Responses message-list form
+            # (the API-key path accepts it too), rather than a bare string.
+            "input": [{"role": "user", "content": card_lab_review_prompt(payload, mainboard)}],
+            "reasoning": {"effort": "low"},
+            # Structured reviews for a dozen candidates can exceed 1,400
+            # tokens (especially with reasoning). Leave room to finish.
+            "max_output_tokens": 2_000,
+            "store": False,
+            "text": {"format": card_lab_review_schema()},
+        }
+        if provider == "chatgpt_plan":
+            request_payload["stream"] = True
+            response_text = fetch_response_text_streaming(request_payload, credential)
+        else:
+            response = fetch_json(
+                OPENAI_RESPONSES_URL,
+                timeout=60,
+                headers={"Authorization": f"Bearer {credential}", "Content-Type": "application/json"},
+                data=json.dumps(request_payload).encode(),
+            )
+            response_text = output_text_from_response(response)
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"{provider_label} returned an unreadable card review") from error
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("reviews"), list):
+            raise RuntimeError(f"{provider_label} returned an invalid card review")
+        return {"reviews": parsed["reviews"]}
+
+    try:
+        review_payload = cached_fetch(cache_key, CARD_LAB_REVIEW_CACHE_TTL_SECONDS, request_review, force_refresh=force_refresh)
+    except RuntimeError as error:
+        return {**payload, "ai_review": {"status": "unavailable", "detail": str(error)}}
+
+    permitted_names = {str(card["name"]).casefold(): card for card in candidates}
+    reviews: dict[str, dict] = {}
+    for review in review_payload.get("reviews", []):
+        if not isinstance(review, dict) or not isinstance(review.get("name"), str):
+            continue
+        candidate = permitted_names.get(review["name"].casefold())
+        score = review.get("score")
+        rationale, cautions = review.get("rationale"), review.get("cautions")
+        if not candidate or review.get("verdict") not in {"recommended", "situational", "reject"} or not isinstance(score, int) or not 0 <= score <= 100:
+            continue
+        if not isinstance(rationale, str) or not isinstance(cautions, list) or not all(isinstance(item, str) for item in cautions):
+            continue
+        reviews[candidate["name"].casefold()] = {"verdict": review["verdict"], "score": score, "rationale": rationale.strip()[:500], "cautions": [item.strip()[:180] for item in cautions if item.strip()][:3]}
+    reviewed = []
+    for candidate in candidates:
+        review = reviews.get(candidate["name"].casefold())
+        if review and review["verdict"] != "reject":
+            reviewed.append({**candidate, "ai_review": review})
+    verdict_rank = {"recommended": 0, "situational": 1}
+    reviewed.sort(key=lambda card: (verdict_rank[card["ai_review"]["verdict"]], -card["ai_review"]["score"], -card["score"], card["name"]))
+    return {**payload, "alternatives": reviewed, "ai_review": {
+        "status": "complete", "model": review_model or os.environ.get("OPENAI_MODEL", OPENAI_CARD_LAB_MODEL),
+        "provider": provider,
+        "provider_label": provider_label,
+        "cache": review_payload.get("cache", {}).get("status", "refreshed"),
+        "reviewed": len(candidates), "rejected": len(candidates) - len(reviewed),
+    }}
+
+
+def fetch_card_alternatives_live(card_name: str, archetype: str, plan: dict) -> dict:
+    source_payload = fetch_json(
+        f"https://api.scryfall.com/cards/named?{urlencode({'exact': card_name})}"
+    )
+    source = card_lab_card(source_payload)
+    if not source:
+        raise RuntimeError("Card Lab needs an exact Pioneer-legal card name")
+    source_roles = set(source["roles"])
+    required_roles = card_lab_required_roles(source_roles)
+    query = card_lab_query(
+        card_lab_primary_type(source["type_line"]), plan["colors"], source_roles
+    )
+    candidates_payload = fetch_json(
+        f"https://api.scryfall.com/cards/search?{urlencode({'q': query, 'unique': 'cards', 'order': 'cmc'})}"
+    )
+    if not isinstance(candidates_payload, dict) or not isinstance(candidates_payload.get("data"), list):
+        raise RuntimeError("Scryfall returned no compatible Pioneer card pool")
+    alternatives: list[dict] = []
+    for raw_candidate in candidates_payload["data"]:
+        candidate = card_lab_card(raw_candidate)
+        if not candidate:
+            continue
+        if (
+            card_lab_primary_type(source["type_line"]) != "land"
+            and abs(float(source["effective_mana_value"]) - float(candidate["effective_mana_value"])) > 2
+        ):
+            continue
+        score, shared_roles, plan_roles = card_lab_score(source, candidate, plan)
+        candidate_roles = set(candidate["roles"])
+        # A candidate must perform at least one non-generic job in common. If
+        # the source has a specific job (cantrip/selection, interaction,
+        # ramp, graveyard setup…), preserve that exact job instead of merely
+        # matching card type and colour identity.
+        if score < 42 or not shared_roles or (required_roles and not (required_roles & candidate_roles)):
+            continue
+        functional_reason = ", ".join(shared_roles).replace("_", " ")
+        plan_reason = ", ".join(plan_roles).replace("_", " ") if plan_roles else "same curve and color identity"
+        alternatives.append({
+            **candidate,
+            "score": score,
+            "functional_reason": f"Shares {functional_reason} with {source['name']}.",
+            "plan_reason": f"Supports {plan_reason} in this {plan['strategy'].casefold()} shell.",
+        })
+    alternatives.sort(key=lambda candidate: (-candidate["score"], candidate["mana_value"], candidate["name"]))
+    return {
+        "kind": "card_lab_alternatives",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "method": "Pioneer legality + non-generic functional-role + archetype-plan hard filters",
+        "source_card": source,
+        "archetype": archetype,
+        "strategy": plan["strategy"],
+        "win_plan": plan["win_plan"],
+        "alternatives": alternatives[:12],
+    }
 
 
 def archetype_slug(name: str) -> str:
@@ -1220,18 +2043,75 @@ def fetch_topdeck(days: int) -> dict:
     }
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    """Avoid transient port conflicts while the source watcher replaces us."""
+
+    allow_reuse_address = True
+
+
 class DelverHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
+    def log_message(self, format: str, *args) -> None:
+        """Keep OAuth authorization codes out of the local development log."""
+        redacted_args = tuple(
+            re.sub(r"/api/chatgpt/callback\?[^\s\"]+", "/api/chatgpt/callback?redacted", str(argument))
+            for argument in args
+        )
+        super().log_message(format, *redacted_args)
+
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/chatgpt/status":
+            return self._send_json(200, chatgpt_connection_status())
+        if parsed.path == "/api/chatgpt/connect":
+            return self._send_json(200, begin_chatgpt_sign_in())
+        if parsed.path == "/api/chatgpt/models":
+            try:
+                return self._send_json(200, {"models": chatgpt_plan_models()})
+            except RuntimeError as error:
+                return self._send_json(502, {"error": str(error)})
+        if parsed.path == "/api/chatgpt/callback":
+            try:
+                connection = complete_chatgpt_sign_in(parse_qs(parsed.query))
+                account = connection.get("account") or "your ChatGPT account"
+                return self._send_html(200, f"""<!doctype html><title>Delver connected</title>
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#090c11;color:#edf3fb;font:16px system-ui}}main{{max-width:430px;padding:36px;border:1px solid #344354;border-radius:12px;background:#111720}}h1{{margin-top:0;color:#b9f56a}}p{{color:#b8c4d1;line-height:1.55}}</style>
+<main><h1>ChatGPT connected</h1><p>Delver can now use the plan token for Card Lab reviews as <strong>{escape(str(account))}</strong>.</p><p>You can close this tab and return to Card Lab.</p></main>""")
+            except RuntimeError as error:
+                return self._send_html(400, f"""<!doctype html><title>Delver connection failed</title>
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#090c11;color:#edf3fb;font:16px system-ui}}main{{max-width:430px;padding:36px;border:1px solid #6b3a35;border-radius:12px;background:#111720}}h1{{margin-top:0;color:#ff8860}}p{{color:#b8c4d1;line-height:1.55}}</style>
+<main><h1>Couldn’t connect ChatGPT</h1><p>{escape(str(error))}</p><p>Return to Card Lab and try again.</p></main>""")
         if parsed.path == "/api/card-profiles":
             names = parse_qs(parsed.query).get("name", [])
             if not names:
                 return self._send_json(400, {"error": "At least one card name is required"})
             try:
                 return self._send_json(200, {"profiles": fetch_card_profiles(names)})
+            except (RuntimeError, ValueError) as error:
+                return self._send_json(502, {"error": str(error)})
+        if parsed.path == "/api/card-alternatives":
+            query = parse_qs(parsed.query)
+            card_name = query.get("card", [""])[0].strip()
+            archetype = query.get("archetype", [""])[0].strip()
+            review_model = query.get("model", [""])[0].strip()
+            force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
+            excluded_cards = {name.strip() for name in query.get("exclude", []) if name.strip()}
+            try:
+                mainboard = json.loads(query.get("mainboard", ["[]"])[0])
+            except json.JSONDecodeError:
+                return self._send_json(400, {"error": "The Card Lab mainboard context is invalid"})
+            if not isinstance(mainboard, list):
+                return self._send_json(400, {"error": "The Card Lab mainboard context must be a list"})
+            if not card_name or not archetype:
+                return self._send_json(400, {"error": "A card name and archetype are required"})
+            try:
+                return self._send_json(200, fetch_card_alternatives(
+                    card_name, archetype, excluded_cards=excluded_cards,
+                    mainboard=mainboard, review_model=review_model or None,
+                    force_refresh=force_refresh,
+                ))
             except (RuntimeError, ValueError) as error:
                 return self._send_json(502, {"error": str(error)})
         if parsed.path == "/api/archetype":
@@ -1320,19 +2200,43 @@ class DelverHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, status: int, body: str):
+        encoded = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
 
 def main() -> None:
     initialize_cache()
-    try:
-        server = ThreadingHTTPServer(("127.0.0.1", 8080), DelverHandler)
-    except OSError as error:
-        if error.errno == EADDRINUSE:
-            raise SystemExit(
-                "Delver is already running at http://127.0.0.1:8080 — open that URL instead."
-            ) from error
-        raise
+    server = None
+    # The watcher starts a replacement process just before the old child has
+    # released its socket on some macOS/Python combinations. Give that child a
+    # short, bounded hand-off window instead of leaving the old code running.
+    for attempt in range(20):
+        try:
+            server = ReusableThreadingHTTPServer(("127.0.0.1", 8080), DelverHandler)
+            break
+        except OSError as error:
+            if error.errno != EADDRINUSE or attempt == 19:
+                raise SystemExit(
+                    "Delver is already running at http://127.0.0.1:8080 — open that URL instead."
+                ) from error
+            time.sleep(0.15)
+    if server is None:
+        raise SystemExit("Delver could not start its local server")
     print("Delver is available at http://127.0.0.1:8080")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        # watchfiles interrupts the child before starting its replacement.
+        # Explicitly close the listening socket so the replacement can bind.
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
