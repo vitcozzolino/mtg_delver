@@ -33,6 +33,7 @@ import requests
 
 
 ROOT = Path(__file__).parent
+UI_ROOT = ROOT / "ui"
 TOPDECK_URL = "https://topdeck.gg/api/v2/tournaments"
 VIDERE_DECKS_URL = "https://api.videreproject.com/decks"
 SPICERACK_URL = "https://api.spicerack.gg/api/export-decklists/"
@@ -2051,7 +2052,7 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 class DelverHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+        super().__init__(*args, directory=str(UI_ROOT), **kwargs)
 
     def log_message(self, format: str, *args) -> None:
         """Keep OAuth authorization codes out of the local development log."""
