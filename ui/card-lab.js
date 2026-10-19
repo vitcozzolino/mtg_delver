@@ -17,6 +17,7 @@ const chatgptConnection = document.querySelector('#chatgptConnection');
 const connectChatGPTButton = document.querySelector('#connectChatGPT');
 const chatgptModelWrap = document.querySelector('#chatgptModelWrap');
 const chatgptModel = document.querySelector('#chatgptModel');
+const aiReviewEnabled = document.querySelector('#aiReviewEnabled');
 const labBrief = document.querySelector('#labBrief');
 const briefPriority = document.querySelector('#briefPriority');
 const briefScope = document.querySelector('#briefScope');
@@ -52,14 +53,18 @@ function loadBaseline() {
     if (saved && Array.isArray(saved.cards) && typeof saved.archetype === 'string') {
       baseline = {
         ...saved,
-        cards: saved.cards.map(card => typeof card === 'string' ? { name: card, quantity: 1 } : card)
+        cards: saved.cards.map(card => typeof card === 'string' ? { name: card, quantity: 1 } : card),
+        sideboard: Array.isArray(saved.sideboard)
+          ? saved.sideboard.map(card => typeof card === 'string' ? { name: card, quantity: 1 } : card)
+          : [],
       };
     }
   } catch { baseline = null; }
   baselineContext.textContent = 'Open Card Lab from the Deck Explorer to use its selected mainboard as the replacement context.';
   baselineContext.classList.remove('active');
   if (baseline?.archetype === archetypeSelect.value) {
-    baselineContext.textContent = `Using ${baseline.deckName || 'the selected'} mainboard: existing cards are excluded from replacement suggestions.`;
+    const sideboardNote = baseline.sideboard?.length ? ` · ${baseline.sideboard.length} sideboard cards inform the deckbuilding review` : '';
+    baselineContext.textContent = `Using ${baseline.deckName || 'the selected'} mainboard: existing cards are excluded from replacement suggestions${sideboardNote}.`;
     baselineContext.classList.add('active');
   }
 }
@@ -90,6 +95,9 @@ function restoreDeckbuilderBrief() {
     briefSameMana.checked = Boolean(constraints.same_mana_value);
     briefSpellDensity.checked = constraints.preserve_spell_density !== false;
   } catch { /* A malformed local preference should never block Card Lab. */ }
+}
+function restoreAiReviewPreference() {
+  aiReviewEnabled.checked = sessionStorage.getItem('delver-ai-review-enabled') !== 'false';
 }
 function scoreLabel(score) {
   if (score >= 80) return 'strong fit';
@@ -241,6 +249,9 @@ function renderResults(payload) {
   } else if (payload.ai_review?.status === 'unavailable') {
     reviewNote.textContent = `Heuristic-only results · deckbuilding review unavailable: ${payload.ai_review.detail}`;
     reviewNote.className = 'ai-review-note unavailable';
+  } else if (payload.ai_review?.status === 'disabled') {
+    reviewNote.textContent = 'AI deckbuilding review is off for this search · showing deterministic role + strategy results.';
+    reviewNote.className = 'ai-review-note';
   } else {
     reviewNote.textContent = '';
     reviewNote.className = 'ai-review-note';
@@ -276,6 +287,7 @@ async function findAlternatives(event) {
     const brief = currentDeckbuilderBrief();
     persistDeckbuilderBrief();
     params.set('brief', JSON.stringify(brief));
+    if (!aiReviewEnabled.checked) params.set('ai', '0');
     if (chatgptModelsLoaded && chatgptModel.value) params.set('model', chatgptModel.value);
     if (baseline?.archetype === archetypeSelect.value) {
       baseline.cards.forEach(card => {
@@ -283,6 +295,7 @@ async function findAlternatives(event) {
         if (name) params.append('exclude', name);
       });
       params.set('mainboard', JSON.stringify(baseline.cards));
+      params.set('sideboard', JSON.stringify(baseline.sideboard || []));
     }
     const response = await fetch(`${CARD_ALTERNATIVES_URL}?${params}`, { cache: 'no-store' });
     const payload = await response.json();
@@ -293,7 +306,8 @@ async function findAlternatives(event) {
     const review = payload.ai_review;
     const reviewNote = review?.status === 'complete'
       ? ` · ${review.provider_label || 'AI'} reviewed ${review.reviewed}, rejected ${review.rejected}`
-      : review?.status === 'unavailable' ? ' · deckbuilding review unavailable' : '';
+      : review?.status === 'unavailable' ? ' · deckbuilding review unavailable'
+      : review?.status === 'disabled' ? ' · AI review off' : '';
     const briefNote = payload.brief_summary?.length ? ` · ${payload.brief_summary.length} brief rules applied` : '';
     labStatus.textContent = `${payload.alternatives.length} candidates ranked for ${payload.archetype}${briefNote}${baselineNote}${reviewNote}${cacheNote}.`;
   } catch (error) {
@@ -310,6 +324,7 @@ archetypeSelect.addEventListener('change', () => {
 document.querySelector('#cardLabForm').addEventListener('submit', findAlternatives);
 connectChatGPTButton.addEventListener('click', connectChatGPT);
 chatgptModel.addEventListener('change', () => sessionStorage.setItem('delver-chatgpt-model', chatgptModel.value));
+aiReviewEnabled.addEventListener('change', () => sessionStorage.setItem('delver-ai-review-enabled', String(aiReviewEnabled.checked)));
 [labBrief, briefPriority, briefScope, briefSameType, briefSameMana, briefSpellDensity]
   .forEach(element => element.addEventListener('change', persistDeckbuilderBrief));
 labBrief.addEventListener('input', persistDeckbuilderBrief);
@@ -317,4 +332,5 @@ populateArchetypes();
 loadBaseline();
 populateExamples();
 restoreDeckbuilderBrief();
+restoreAiReviewPreference();
 loadChatGPTStatus();

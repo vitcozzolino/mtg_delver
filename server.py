@@ -1078,8 +1078,10 @@ def fetch_card_alternatives(
     *,
     excluded_cards: set[str] | None = None,
     mainboard: list[dict] | None = None,
+    sideboard: list[dict] | None = None,
     review_model: str | None = None,
     brief: object = None,
+    ai_enabled: bool = True,
     force_refresh: bool = False,
 ) -> dict:
     plan = CARD_LAB_ARCHETYPES.get(archetype)
@@ -1106,9 +1108,15 @@ def fetch_card_alternatives(
             "excluded_cards": len(excluded),
         }
     brief_payload = apply_card_lab_brief(filtered_payload, card_lab_brief(brief))
+    if not ai_enabled:
+        return {**brief_payload, "ai_review": {
+            "status": "disabled",
+            "detail": "AI deckbuilding review disabled for this search.",
+        }}
     return review_card_alternatives_with_llm(
         brief_payload,
         mainboard=mainboard or [],
+        sideboard=sideboard or [],
         review_model=review_model,
         force_refresh=force_refresh,
     )
@@ -1161,7 +1169,7 @@ def card_lab_review_schema() -> dict:
     }
 
 
-def card_lab_review_prompt(payload: dict, mainboard: list[dict]) -> str:
+def card_lab_review_prompt(payload: dict, mainboard: list[dict], sideboard: list[dict]) -> str:
     source = payload["source_card"]
     # Review the strongest heuristic matches only. This keeps the structured
     # response bounded and avoids making the user wait on a long plan request.
@@ -1175,6 +1183,7 @@ def card_lab_review_prompt(payload: dict, mainboard: list[dict]) -> str:
         "deckbuilder_brief": payload.get("deckbuilder_brief", {}),
         "brief_summary": payload.get("brief_summary", []),
         "baseline_mainboard": card_lab_mainboard_lines(mainboard),
+        "baseline_sideboard": card_lab_mainboard_lines(sideboard),
         "source_card": {
             "name": source["name"], "type_line": source["type_line"],
             "mana_value": source["mana_value"], "oracle_text": source["oracle_text"],
@@ -1242,7 +1251,7 @@ def card_lab_review_candidates(candidates: list[dict]) -> list[dict]:
 
 
 def review_card_alternatives_with_llm(
-    payload: dict, *, mainboard: list[dict], review_model: str | None, force_refresh: bool,
+    payload: dict, *, mainboard: list[dict], sideboard: list[dict], review_model: str | None, force_refresh: bool,
 ) -> dict:
     """Ask a bounded deckbuilding reviewer, never to generate arbitrary cards."""
     plan_error = ""
@@ -1271,6 +1280,7 @@ def review_card_alternatives_with_llm(
     review_context = {**payload, "alternatives": candidates}
     context_fingerprint = sha256(json.dumps({
         "mainboard": card_lab_mainboard_lines(mainboard),
+        "sideboard": card_lab_mainboard_lines(sideboard),
         "candidates": [card["name"] for card in candidates],
         "source": payload["source_card"]["name"],
         "archetype": payload["archetype"],
@@ -1285,7 +1295,7 @@ def review_card_alternatives_with_llm(
             "instructions": "You are a precise competitive Magic: The Gathering Pioneer deckbuilder. Follow the supplied rules text and return only the requested JSON schema.",
             # ChatGPT plan inference requires the Responses message-list form
             # (the API-key path accepts it too), rather than a bare string.
-            "input": [{"role": "user", "content": card_lab_review_prompt(review_context, mainboard)}],
+            "input": [{"role": "user", "content": card_lab_review_prompt(review_context, mainboard, sideboard)}],
             # Terra supports ``none`` (rather than ``minimal``). The
             # deterministic layer already narrows the field, so reserve the
             # completion budget for the strict JSON review.
@@ -1452,7 +1462,7 @@ def fetch_mtgdecklists_archetype(
     most 20 recent pages and persists results locally for six hours.
     """
     limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
-    cache_key = f"archetype:{archetype_slug(archetype)}:{days}:{limit}"
+    cache_key = f"archetype:v2:{archetype_slug(archetype)}:{days}:{limit}"
     return cached_fetch(
         cache_key,
         ARCHETYPE_CACHE_TTL_SECONDS,
@@ -1511,12 +1521,21 @@ def fetch_mtgdecklists_archetype_live(archetype: str, days: int, limit: int) -> 
         deck_text = "\n".join(f"{quantity} {html_text(name)}" for quantity, name in cards)
         if not deck_text:
             return None
+        sideboard_cards = re.findall(
+            r'<figcaption><span class="qty">(\d+)</span>(.*?)</figcaption>',
+            page[main_match.end():],
+            re.DOTALL,
+        )
+        sideboard_text = "\n".join(
+            f"{quantity} {html_text(name)}" for quantity, name in sideboard_cards
+        )
         return {
             **entry,
             "archetype": archetype,
             "source": "mtgdecklists",
             "format": "pioneer",
             "deck_text": deck_text,
+            "sideboard_text": sideboard_text,
         }
 
     decks: list[dict] = []
@@ -1606,6 +1625,7 @@ def parse_mtgcontent_decks(page: str) -> list[dict]:
             "source": "mtgcontent",
             "format": "pioneer",
             "deck_text": mainboard,
+            "sideboard_text": mtgcontent_mainboard(record["cards"].get("sideboard")),
             "source_url": record.get("url") or "https://www.mtgcontent.com/decklists",
         })
     return decks
@@ -1619,7 +1639,7 @@ def fetch_mtgcontent_archetype(
     force_refresh: bool = False,
 ) -> dict:
     limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
-    cache_key = f"mtgcontent:{archetype_slug(archetype)}:{days}:{limit}"
+    cache_key = f"mtgcontent:v2:{archetype_slug(archetype)}:{days}:{limit}"
     return cached_fetch(
         cache_key,
         ARCHETYPE_CACHE_TTL_SECONDS,
@@ -1758,11 +1778,11 @@ def parse_mtgtop8_entries(page: str, cutoff: str, limit: int) -> list[dict]:
     return entries
 
 
-def mtgtop8_mainboard(page: str) -> str:
-    """Read only main-deck card rows; MTGTop8 marks those rows with an md id."""
+def mtgtop8_board(page: str, board_id_prefix: str) -> str:
+    """Read card rows for one MTGTop8 board (``md`` or ``sb``)."""
     lines: list[str] = []
     pattern = re.compile(
-        r'<div\s+id=["\']?md[^>]*class=["\'][^"\']*deck_line[^"\']*["\'][^>]*>'
+        rf'<div\s+id=["\']?{re.escape(board_id_prefix)}[^>]*class=["\'][^"\']*deck_line[^"\']*["\'][^>]*>'
         r'\s*(?P<quantity>\d+)\s*<span[^>]*>(?P<name>.*?)</span>',
         re.IGNORECASE | re.DOTALL,
     )
@@ -1771,8 +1791,14 @@ def mtgtop8_mainboard(page: str) -> str:
         quantity = int(match.group("quantity"))
         if name and quantity > 0:
             lines.append(f"{quantity} {name}")
-    total = sum(int(line.split(" ", 1)[0]) for line in lines)
-    return "\n".join(lines) if 40 <= total <= 100 else ""
+    return "\n".join(lines)
+
+
+def mtgtop8_mainboard(page: str) -> str:
+    """Read only main-deck card rows; MTGTop8 marks those rows with an md id."""
+    lines = mtgtop8_board(page, "md")
+    total = sum(int(line.split(" ", 1)[0]) for line in lines.splitlines())
+    return lines if 40 <= total <= 100 else ""
 
 
 def fetch_mtgtop8_archetype(
@@ -1784,7 +1810,7 @@ def fetch_mtgtop8_archetype(
 ) -> dict:
     """Fetch a small, cached Pioneer sample from MTGTop8's public pages."""
     limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
-    cache_key = f"mtgtop8:{archetype_slug(archetype)}:{days}:{limit}"
+    cache_key = f"mtgtop8:v2:{archetype_slug(archetype)}:{days}:{limit}"
     return cached_fetch(
         cache_key,
         ARCHETYPE_CACHE_TTL_SECONDS,
@@ -1816,7 +1842,8 @@ def fetch_mtgtop8_archetype_live(archetype: str, days: int, limit: int) -> dict:
         # requests: one selected archetype, one request at a time, then cache.
         time.sleep(MTG_TOP8_REQUEST_DELAY_SECONDS)
         try:
-            deck_text = mtgtop8_mainboard(fetch_html(entry["source_url"]))
+            page = fetch_html(entry["source_url"])
+            deck_text = mtgtop8_mainboard(page)
         except RuntimeError:
             continue
         if not deck_text:
@@ -1827,6 +1854,7 @@ def fetch_mtgtop8_archetype_live(archetype: str, days: int, limit: int) -> dict:
             "source": "mtgtop8",
             "format": "pioneer",
             "deck_text": deck_text,
+            "sideboard_text": mtgtop8_board(page, "sb"),
         })
     payload = {
         "schema_version": "1",
@@ -1873,16 +1901,18 @@ def moxfield_headers() -> dict[str, str]:
     return {"User-Agent": user_agent}
 
 
-def moxfield_mainboard(deck: object) -> str:
+def moxfield_board(deck: object, board_name: str) -> str:
     if not isinstance(deck, dict):
         return ""
     boards = deck.get("boards")
     if not isinstance(boards, dict):
         return ""
-    mainboard = boards.get("mainboard") or boards.get("main")
-    if not isinstance(mainboard, dict):
+    board = boards.get(board_name)
+    if board is None and board_name == "mainboard":
+        board = boards.get("main")
+    if not isinstance(board, dict):
         return ""
-    cards = mainboard.get("cards")
+    cards = board.get("cards")
     if not isinstance(cards, dict):
         return ""
     lines: list[str] = []
@@ -1895,6 +1925,10 @@ def moxfield_mainboard(deck: object) -> str:
         if isinstance(name, str) and isinstance(quantity, int) and quantity > 0:
             lines.append(f"{quantity} {name}")
     return "\n".join(lines)
+
+
+def moxfield_mainboard(deck: object) -> str:
+    return moxfield_board(deck, "mainboard")
 
 
 def moxfield_date(value: object) -> str:
@@ -1917,7 +1951,7 @@ def fetch_moxfield_archetype(
     limit = max(1, min(limit, MAX_ARCHETYPE_DECKS))
     min_views = nonnegative_int_env("MOXFIELD_MIN_VIEWS", 50)
     min_likes = nonnegative_int_env("MOXFIELD_MIN_LIKES", 2)
-    cache_key = f"moxfield:{archetype_slug(archetype)}:{days}:{limit}:{min_views}:{min_likes}"
+    cache_key = f"moxfield:v2:{archetype_slug(archetype)}:{days}:{limit}:{min_views}:{min_likes}"
     return cached_fetch(
         cache_key,
         ARCHETYPE_CACHE_TTL_SECONDS,
@@ -2000,6 +2034,7 @@ def fetch_moxfield_archetype_live(
             "source": "moxfield",
             "format": "pioneer",
             "deck_text": deck_text,
+            "sideboard_text": moxfield_board(full_deck, "sideboard"),
             "source_url": summary.get("publicUrl") or f"https://www.moxfield.com/decks/{public_id}",
         })
     payload = {
@@ -2075,6 +2110,7 @@ def fetch_videre(days: int) -> list[dict]:
                 "source": "videre",
                 "format": "pioneer",
                 "deck_text": deck_text,
+                "sideboard_text": videre_mainboard(row.get("sideboard")),
                 "source_url": "https://www.videreproject.com/",
             })
             if len(decks) >= MAX_VIDERE_DECKS:
@@ -2152,7 +2188,7 @@ def deduplicate(decks: list[dict]) -> list[dict]:
 def fetch_pioneer_sources(days: int, *, force_refresh: bool = False) -> dict:
     """Merge evidence-grade MTGO and paper tournament lists without a single-source dependency."""
     return cached_fetch(
-        f"pioneer:{days}",
+        f"pioneer:v2:{days}",
         SOURCE_CACHE_TTL_SECONDS,
         lambda: fetch_pioneer_sources_live(days),
         force_refresh=force_refresh,
@@ -2287,6 +2323,18 @@ class DelverHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(UI_ROOT), **kwargs)
 
+    def send_header(self, keyword: str, value: str) -> None:
+        if keyword.lower() == "cache-control":
+            self._sent_cache_control = True
+        super().send_header(keyword, value)
+
+    def end_headers(self) -> None:
+        # Static frontend files are edited while the local watcher is running.
+        # Avoid a browser retaining an older app.js or stylesheet after reload.
+        if not getattr(self, "_sent_cache_control", False):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def log_message(self, format: str, *args) -> None:
         """Keep OAuth authorization codes out of the local development log."""
         redacted_args = tuple(
@@ -2330,6 +2378,7 @@ class DelverHandler(SimpleHTTPRequestHandler):
             card_name = query.get("card", [""])[0].strip()
             archetype = query.get("archetype", [""])[0].strip()
             review_model = query.get("model", [""])[0].strip()
+            ai_enabled = query.get("ai", ["1"])[0].lower() not in {"0", "false", "no"}
             force_refresh = query.get("refresh", [""])[0].lower() in {"1", "true", "yes"}
             excluded_cards = {name.strip() for name in query.get("exclude", []) if name.strip()}
             try:
@@ -2337,11 +2386,17 @@ class DelverHandler(SimpleHTTPRequestHandler):
             except json.JSONDecodeError:
                 return self._send_json(400, {"error": "The Card Lab mainboard context is invalid"})
             try:
+                sideboard = json.loads(query.get("sideboard", ["[]"])[0])
+            except json.JSONDecodeError:
+                return self._send_json(400, {"error": "The Card Lab sideboard context is invalid"})
+            try:
                 brief = json.loads(query.get("brief", ["{}"])[0])
             except json.JSONDecodeError:
                 return self._send_json(400, {"error": "The Deckbuilder Brief is invalid"})
             if not isinstance(mainboard, list):
                 return self._send_json(400, {"error": "The Card Lab mainboard context must be a list"})
+            if not isinstance(sideboard, list):
+                return self._send_json(400, {"error": "The Card Lab sideboard context must be a list"})
             if not isinstance(brief, dict):
                 return self._send_json(400, {"error": "The Deckbuilder Brief must be an object"})
             if not card_name or not archetype:
@@ -2349,8 +2404,9 @@ class DelverHandler(SimpleHTTPRequestHandler):
             try:
                 return self._send_json(200, fetch_card_alternatives(
                     card_name, archetype, excluded_cards=excluded_cards,
-                    mainboard=mainboard, review_model=review_model or None,
+                    mainboard=mainboard, sideboard=sideboard, review_model=review_model or None,
                     brief=brief,
+                    ai_enabled=ai_enabled,
                     force_refresh=force_refresh,
                 ))
             except (RuntimeError, ValueError) as error:

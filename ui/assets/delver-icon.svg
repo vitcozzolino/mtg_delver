@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Delver">
+  <defs>
+    <linearGradient id="sky" x1="18" y1="15" x2="105" y2="113" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#62c9ff"/>
+      <stop offset=".55" stop-color="#b9f56a"/>
+      <stop offset="1" stop-color="#ff8860"/>
+    </linearGradient>
+    <filter id="glow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="128" height="128" rx="27" fill="#0b1017"/>
+  <rect x="8" y="8" width="112" height="112" rx="21" fill="#111b27" stroke="#314254" stroke-width="2"/>
+  <path d="M31 94V34h31c20 0 35 11 35 29 0 19-15 31-36 31H49v-14h12c12 0 20-6 20-17s-8-16-20-16H48v47H31Z" fill="url(#sky)"/>
+  <path d="M62 31c12 7 22 15 29 27-11-7-22-9-34-8 3-8 3-13 5-19Z" fill="#62c9ff" filter="url(#glow)"/>
+  <path d="M49 88c10-1 22 0 36 8-13 1-25-2-36-8Z" fill="#b9f56a" filter="url(#glow)"/>
+  <circle cx="93" cy="36" r="4" fill="#ff8860"/>
+</svg>

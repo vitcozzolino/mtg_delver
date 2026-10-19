@@ -4,18 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="Pioneer archetype deck explorer" />
+    <meta name="theme-color" content="#090c11" />
+    <meta property="og:title" content="Delver — Pioneer Deck Explorer" />
+    <meta property="og:description" content="Compare tournament lists, find the shared core, and test the flex." />
+    <meta property="og:image" content="./assets/delver-banner-ai.png" />
+    <meta name="twitter:card" content="summary_large_image" />
     <title>Delver — Pioneer Deck Explorer</title>
+    <link rel="icon" href="./assets/delver-icon-ai.png" type="image/png" />
+    <link rel="apple-touch-icon" href="./assets/delver-icon-ai.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Fraunces:opsz,wght@9..144,600;9..144,700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=personal-list-20261018" />
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <a class="brand" href="#">delver<span>_</span></a>
+        <a class="brand" href="#"><img class="brand-mark" src="./assets/delver-icon-ai.png" alt="" />delver<span>_</span></a>
         <div class="format-pill" id="dataStatus"><span class="status-dot"></span> Loading live Pioneer data…</div>
-        <a class="ghost-button" id="cardLabLink" href="./card-lab.html">Card Lab</a>
         <button class="ghost-button" id="aboutButton">How it works</button>
       </header>
       <div class="sync-progress" id="syncProgress" role="status" aria-live="polite" hidden>
@@ -64,6 +70,7 @@
         </div>
         <div class="local-import-actions">
           <input id="savedHtmlFiles" type="file" accept="text/html,.html,.htm" multiple hidden />
+          <button id="addOwnList" class="import-button own-list-button" type="button">Paste your list</button>
           <button id="importSavedHtml" class="import-button" type="button">Import saved HTML</button>
           <p id="localImportStatus" class="local-import-status" role="status" aria-live="polite">Choose one or more individual deck pages.</p>
         </div>
@@ -140,6 +147,20 @@
       <p class="dialog-note">Delver merges recent tournament sources with small, cached archetype supplements. Treat community lists and historical imports as ideas, not metagame proof.</p>
     </dialog>
 
+    <dialog id="ownListDialog" class="own-list-dialog">
+      <button class="close-button" id="closeOwnList" aria-label="Close">×</button>
+      <p class="eyebrow">YOUR BASELINE</p>
+      <h2>Paste your decklist</h2>
+      <p>Use one card per line, such as <code>4 Arclight Phoenix</code>. Add a line containing <code>Sideboard</code> to include your 15.</p>
+      <form id="ownListForm">
+        <label class="own-list-field" for="ownListName">Deck name <span>optional</span><input id="ownListName" maxlength="80" placeholder="My Izzet Phoenix" /></label>
+        <label class="own-list-field" for="ownListArchetype">Compare against archetype<select id="ownListArchetype"></select></label>
+        <label class="own-list-field" for="ownListText">Decklist<textarea id="ownListText" required spellcheck="false" placeholder="4 Arclight Phoenix&#10;4 Consider&#10;…&#10;&#10;Sideboard&#10;2 Mystical Dispute"></textarea></label>
+        <p id="ownListError" class="own-list-error" role="alert" hidden></p>
+        <button class="primary-button" type="submit">Use as my baseline <span>→</span></button>
+      </form>
+    </dialog>
+
     <template id="experimentTemplate">
       <article class="experiment-card">
         <div class="experiment-number"></div>
@@ -152,6 +173,6 @@
         <button class="queue-button">Queue test <span>+</span></button>
       </article>
     </template>
-    <script src="./app.js"></script>
+    <script src="./app.js?v=personal-list-20261018"></script>
   </body>
 </html>

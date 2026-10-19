@@ -44,7 +44,12 @@ const supplementLimit = document.querySelector('#supplementLimit');
 const moxfieldEnabled = document.querySelector('#moxfieldEnabled');
 const savedHtmlFiles = document.querySelector('#savedHtmlFiles');
 const importSavedHtml = document.querySelector('#importSavedHtml');
+const addOwnList = document.querySelector('#addOwnList');
+const ownListDialog = document.querySelector('#ownListDialog');
+const ownListForm = document.querySelector('#ownListForm');
+const ownListArchetype = document.querySelector('#ownListArchetype');
 const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => [...document.querySelectorAll(selector)];
 const fallbackIsLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
 const cardPreview = $('#cardPreview');
 const cardCache = new Map();
@@ -55,6 +60,19 @@ let loadingMessageTimer;
 const MIN_LOADING_FEEDBACK_MS = 800;
 let archetypeLoadToken = 0;
 const importedDecks = [];
+const PERSONAL_DECKS_STORAGE_KEY = 'delver-personal-decks-v1';
+const personalDecks = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PERSONAL_DECKS_STORAGE_KEY) || '[]');
+    return Array.isArray(saved) ? saved.filter(deck => deck?.archetype && deck?.cards) : [];
+  } catch {
+    return [];
+  }
+})();
+
+function savePersonalDecks() {
+  try { localStorage.setItem(PERSONAL_DECKS_STORAGE_KEY, JSON.stringify(personalDecks)); } catch (error) { console.warn('Could not save personal decklists locally', error); }
+}
 
 function profileFor(name) { return cardProfiles.get(name); }
 function isLand(name) {
@@ -106,7 +124,10 @@ function swapCompatibility(addName, cutName) {
 async function ensureCardProfiles(archetype) {
   const data = datasets[archetype];
   if (!data) return;
-  const missing = [...new Set(data.decks.flatMap(deck => Object.keys(deck.cards)).filter(name => !cardProfiles.has(name)))];
+  const personalCards = personalDecks
+    .filter(deck => deck.archetype === archetype)
+    .flatMap(deck => [...Object.keys(deck.cards), ...Object.keys(deck.sideboard || {})]);
+  const missing = [...new Set([...data.decks.flatMap(deck => Object.keys(deck.cards)), ...personalCards].filter(name => !cardProfiles.has(name)))];
   for (let index = 0; index < missing.length; index += 75) {
     const params = new URLSearchParams();
     missing.slice(index, index + 75).forEach(name => params.append('name', name));
@@ -127,7 +148,7 @@ function setLoading(isLoading, title = 'Loading current decklists', detail = 'Co
   progress.hidden = !isLoading;
   document.body.classList.toggle('is-loading', isLoading);
   document.querySelector('.app-shell').setAttribute('aria-busy', String(isLoading));
-  [selectArchetype, selectDeck, range, supplementLimit, moxfieldEnabled, importSavedHtml, refresh, analyze].forEach(control => { control.disabled = isLoading; });
+  [selectArchetype, selectDeck, range, supplementLimit, moxfieldEnabled, addOwnList, importSavedHtml, refresh, analyze].forEach(control => { control.disabled = isLoading; });
   refresh.classList.toggle('is-spinning', isLoading);
   if (!isLoading) return;
   $('#loadingTitle').textContent = title;
@@ -141,18 +162,28 @@ function setLoading(isLoading, title = 'Loading current decklists', detail = 'Co
   }, 1800);
 }
 
-function parseMainboard(deckText) {
-  const cards = {};
-  for (const line of deckText.split(/\r?\n/)) {
-    if (/^sideboard\s*$/i.test(line.trim())) break;
-    const match = line.match(/^(\d+)\s+(.+)$/);
-    if (match) {
+function parseDeckSections(deckText, sideboardText = '') {
+  const mainboard = {};
+  const sideboard = {};
+  let target = mainboard;
+  const addLines = (text, destination) => {
+    for (const line of String(text || '').split(/\r?\n/)) {
+      const match = line.trim().match(/^(\d+)\s+(.+)$/);
+      if (!match) continue;
       const name = match[2].trim();
-      cards[name] = (cards[name] || 0) + Number(match[1]);
+      destination[name] = (destination[name] || 0) + Number(match[1]);
     }
+  };
+  for (const line of String(deckText || '').split(/\r?\n/)) {
+    if (/^sideboard\s*$/i.test(line.trim())) { target = sideboard; continue; }
+    addLines(line, target);
   }
-  return cards;
+  // Sources with separate board fields do not need to embed Sideboard in
+  // deck_text. Merge that field without touching main-deck analysis.
+  addLines(sideboardText, sideboard);
+  return { mainboard, sideboard };
 }
+function parseMainboard(deckText) { return parseDeckSections(deckText).mainboard; }
 function formatGeneratedAt(timestamp) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(timestamp));
 }
@@ -160,7 +191,7 @@ function buildLiveDatasets(feed) {
   const grouped = {};
   feed.events.flatMap(feedEvent => feedEvent.decks.map(deck => ({ ...deck, feedEvent }))).forEach(record => {
     if (!record.deck_text || !record.archetype || /^(unknown|ur|ub|wg|wubg|brg|g|b)$/i.test(record.archetype)) return;
-    const cards = parseMainboard(record.deck_text);
+    const { mainboard: cards, sideboard } = parseDeckSections(record.deck_text, record.sideboard_text);
     if (!Object.keys(cards).length) return;
     const ageDays = Math.max(0, Math.floor((Date.now() - new Date(`${record.date}T12:00:00Z`)) / 86400000));
     const archetype = record.archetype;
@@ -172,6 +203,7 @@ function buildLiveDatasets(feed) {
       date: record.date,
       ageDays,
       cards,
+      sideboard,
       player: record.player,
       sourceUrl: record.source_url || record.feedEvent.url,
       historicalArchive: Boolean(record.historical_archive)
@@ -230,10 +262,16 @@ function deckFromSavedMtgDecksPage(html, fileName, fallbackArchetype) {
     : -1;
   if (mainStart < 0 || sideStart < 0) return null;
   const mainHtml = html.slice(mainStart, mainStart + sideStart);
+  const sideboardHtml = html.slice(mainStart + sideStart);
   const cards = {};
+  const sideboard = {};
   for (const [, quantity, rawName] of mainHtml.matchAll(/<figcaption[^>]*>\s*<span[^>]*class=["']qty["'][^>]*>(\d+)<\/span>(.*?)<\/figcaption>/gis)) {
     const name = htmlFragmentText(rawName);
     if (name) cards[name] = (cards[name] || 0) + Number(quantity);
+  }
+  for (const [, quantity, rawName] of sideboardHtml.matchAll(/<figcaption[^>]*>\s*<span[^>]*class=["']qty["'][^>]*>(\d+)<\/span>(.*?)<\/figcaption>/gis)) {
+    const name = htmlFragmentText(rawName);
+    if (name) sideboard[name] = (sideboard[name] || 0) + Number(quantity);
   }
   if (Object.values(cards).reduce((total, quantity) => total + quantity, 0) < 40) return null;
   const rawHeading = documentNode.querySelector('h1')?.textContent.replace(/\s+/g, ' ').trim();
@@ -248,6 +286,7 @@ function deckFromSavedMtgDecksPage(html, fileName, fallbackArchetype) {
     date,
     ageDays: Math.max(0, Math.floor((Date.now() - new Date(`${date}T12:00:00Z`)) / 86400000)),
     cards,
+    sideboard,
     player: player || cleanFileName,
     sourceUrl: 'https://mtgdecks.net/',
   };
@@ -317,6 +356,53 @@ async function importSavedHtmlPages(files) {
     setLoading(false);
   }
 }
+
+function openOwnListDialog() {
+  ownListArchetype.innerHTML = '';
+  Object.keys(datasets).sort().forEach(name => ownListArchetype.add(new Option(name, name)));
+  ownListArchetype.value = selectArchetype.value;
+  $('#ownListError').hidden = true;
+  ownListDialog.showModal();
+  $('#ownListName').focus();
+}
+
+async function addPersonalDeck(event) {
+  event.preventDefault();
+  const { mainboard: cards, sideboard } = parseDeckSections($('#ownListText').value);
+  const mainboardCount = Object.values(cards).reduce((total, quantity) => total + quantity, 0);
+  if (mainboardCount < 40 || mainboardCount > 100) {
+    const error = $('#ownListError');
+    error.textContent = `I found ${mainboardCount} mainboard cards. Paste a 40–100 card decklist with quantities such as “4 Consider”.`;
+    error.hidden = false;
+    return;
+  }
+  const archetype = ownListArchetype.value;
+  const name = $('#ownListName').value.trim() || 'My Pioneer list';
+  const personalDeck = {
+    archetype,
+    name,
+    event: 'Personal decklist',
+    finish: 'Personal baseline',
+    date: new Date().toISOString().slice(0, 10),
+    ageDays: 0,
+    cards,
+    sideboard,
+    player: 'You',
+    sourceUrl: '',
+    personal: true,
+  };
+  personalDecks.push(personalDeck);
+  savePersonalDecks();
+  const personalIndex = personalDecks.length - 1;
+  if (selectArchetype.value !== archetype) selectArchetype.value = archetype;
+  updateDeckChoices();
+  selectDeck.value = `own:${personalIndex}`;
+  try { await ensureCardProfiles(archetype); } catch (error) { console.warn(error.message); }
+  render();
+  ownListForm.reset();
+  ownListDialog.close();
+}
+
 async function enrichArchetype(archetype, days, { showLoading = false, forceRefresh = false } = {}) {
   const token = ++archetypeLoadToken;
   if (showLoading) setLoading(true, `Expanding ${archetype}`, 'Loading additional published tournament lists…');
@@ -519,11 +605,19 @@ function populateArchetypes(preferredArchetype) {
 function updateDeckChoices() {
   selectDeck.innerHTML = '';
   datasets[selectArchetype.value].decks.forEach((deck, index) => selectDeck.add(new Option(deck.name, index)));
+  const ownForArchetype = personalDecks
+    .map((deck, index) => ({ deck, index }))
+    .filter(({ deck }) => deck.archetype === selectArchetype.value);
+  if (ownForArchetype.length) {
+    const group = document.createElement('optgroup');
+    group.label = 'Your pasted lists';
+    ownForArchetype.forEach(({ deck, index }) => group.append(new Option(`★ ${deck.name}`, `own:${index}`)));
+    selectDeck.append(group);
+  }
 }
 function updateCardLabLink(analysis) {
   const archetype = selectArchetype.value;
   const destination = archetype ? `./card-lab.html?archetype=${encodeURIComponent(archetype)}` : './card-lab.html';
-  $('#cardLabLink').href = destination;
   $('#baselineCardLabLink').href = destination;
   if (!analysis) return;
   sessionStorage.setItem('delver-card-lab-baseline', JSON.stringify({
@@ -531,14 +625,20 @@ function updateCardLabLink(analysis) {
     deckName: analysis.base.name,
     cards: Object.entries(analysis.base.cards)
       .map(([name, quantity]) => ({ name, quantity }))
-      .sort((first, second) => first.name.localeCompare(second.name))
+      .sort((first, second) => first.name.localeCompare(second.name)),
+    sideboard: Object.entries(analysis.base.sideboard || {})
+      .map(([name, quantity]) => ({ name, quantity }))
+      .sort((first, second) => first.name.localeCompare(second.name)),
   }));
 }
 function getAnalysis() {
   const data = datasets[selectArchetype.value];
-  const base = data.decks[Number(selectDeck.value)];
+  const selected = selectDeck.value;
+  const ownMatch = selected.match(/^own:(\d+)$/);
+  const base = ownMatch ? personalDecks[Number(ownMatch[1])] : data.decks[Number(selected)];
+  if (!base) throw new Error('Choose a starting list to analyze');
   const decks = data.decks.filter(deck => deck.historicalArchive || deck.ageDays <= Number(range.value));
-  if (!decks.includes(base)) decks.unshift(base);
+  if (!ownMatch && !decks.includes(base)) decks.unshift(base);
   const totals = {};
   decks.forEach(deck => Object.entries(deck.cards).forEach(([card, quantity]) => {
     totals[card] ??= { appearances: 0, copies: 0, byDeck: [] };
@@ -547,7 +647,7 @@ function getAnalysis() {
   const threshold = Math.ceil(decks.length * .67);
   const core = Object.entries(totals).filter(([card,info]) => info.appearances >= threshold && !isLand(card)).sort((a,b) => b[1].appearances - a[1].appearances || b[1].copies-a[1].copies);
   const variants = Object.entries(totals).filter(([card,info]) => info.appearances > 0 && info.appearances < threshold && !isLand(card));
-  return { data, base, decks, totals, core, variants, threshold };
+  return { data, base, decks, totals, core, variants, threshold, baseIsPersonal: Boolean(ownMatch) };
 }
 function renderDeck(analysis) {
   const { base, totals, threshold } = analysis;
@@ -562,17 +662,42 @@ function renderDeck(analysis) {
   Object.entries(base.cards)
     .sort((a,b) => a[0].localeCompare(b[0]))
     .forEach(([name, quantity]) => sections[sectionForType[primaryCardType(name)]].push([name, quantity]));
-  $('#deckList').innerHTML = sectionOrder
+  const mainboardMarkup = sectionOrder
     .filter(section => sections[section].length)
-    .map(section => `<div class="section-name">${section}</div>${sections[section].map(([name,quantity]) => `<div class="deck-row ${totals[name].appearances >= threshold && section !== 'Lands' ? 'core' : ''} ${section === 'Lands' ? 'land' : ''}"><span class="quantity" title="Copies in your selected list">${quantity}×</span>${cardLabel(name, 'card-name')}<span class="delta" title="Sampled lists containing this card">${totals[name].appearances}/${analysis.decks.length} lists</span></div>`).join('')}`)
+    .map(section => `<div class="section-name">${section}</div>${sections[section].map(([name,quantity]) => { const sampled = totals[name] || { appearances: 0 }; return `<div class="deck-row ${sampled.appearances >= threshold && section !== 'Lands' ? 'core' : ''} ${section === 'Lands' ? 'land' : ''}"><span class="quantity" title="Copies in your selected list">${quantity}×</span>${cardLabel(name, 'card-name')}<span class="delta" title="Sampled lists containing this card">${sampled.appearances}/${analysis.decks.length} lists</span></div>`; }).join('')}`)
     .join('');
+  const sideboardEntries = Object.entries(base.sideboard || {}).sort((a, b) => a[0].localeCompare(b[0]));
+  const mainboardCount = Object.values(base.cards).reduce((total, quantity) => total + quantity, 0);
+  const sideboardCount = sideboardEntries.reduce((total, [, quantity]) => total + quantity, 0);
+  const sideboardMarkup = sideboardEntries.length
+    ? sideboardEntries.map(([name, quantity]) => `<div class="deck-row sideboard"><span class="quantity">${quantity}×</span>${cardLabel(name, 'card-name')}</div>`).join('')
+    : '<p class="sideboard-unavailable">No sideboard was published with this list.</p>';
+  $('#deckList').innerHTML = `<div class="deck-board-tabs" role="tablist" aria-label="Deck section">
+    <button class="deck-board-tab is-active" type="button" role="tab" aria-selected="true" data-board="mainboard">Mainboard <span>${mainboardCount}</span></button>
+    <button class="deck-board-tab" type="button" role="tab" aria-selected="false" data-board="sideboard">Sideboard <span>${sideboardCount || '—'}</span></button>
+  </div>
+  <div class="deck-board" data-board-panel="mainboard">${mainboardMarkup}</div>
+  <div class="deck-board" data-board-panel="sideboard" hidden><div class="sideboard-heading"><span>Sideboard</span><span>${sideboardCount ? `${sideboardCount} cards` : 'Not published'}</span></div>${sideboardMarkup}</div>`;
+}
+
+function bindDeckBoardTabs() {
+  $$('.deck-board-tab').forEach(tab => tab.addEventListener('click', () => {
+    const board = tab.dataset.board;
+    $$('.deck-board-tab').forEach(button => {
+      const selected = button === tab;
+      button.classList.toggle('is-active', selected);
+      button.setAttribute('aria-selected', String(selected));
+    });
+    $$('[data-board-panel]').forEach(panel => { panel.hidden = panel.dataset.boardPanel !== board; });
+  }));
 }
 function renderAnalysis(analysis) {
   const totalCards = Object.values(analysis.base.cards).reduce((a,b)=>a+b,0);
-  const flexInBase = Object.keys(analysis.base.cards).filter(card => !isLand(card) && analysis.totals[card].appearances < analysis.threshold).reduce((sum,card)=>sum+analysis.base.cards[card],0);
+  const flexInBase = Object.keys(analysis.base.cards).filter(card => !isLand(card) && (analysis.totals[card]?.appearances || 0) < analysis.threshold).reduce((sum,card)=>sum+analysis.base.cards[card],0);
   const historicalCount = analysis.decks.filter(deck => deck.historicalArchive && deck.ageDays > Number(range.value)).length;
   const historicalNote = historicalCount ? ` · includes ${historicalCount} historical local Phoenix archive list${historicalCount === 1 ? '' : 's'}` : '';
-  $('#dataNote').innerHTML = `<strong>${analysis.decks.length} sampled lists</strong> · window set to ${range.value} days${historicalNote} · ${analysis.data.note} · <a href="${analysis.data.sourceUrl}" target="_blank" rel="noreferrer">View source snapshot ↗</a>`;
+  const personalNote = analysis.baseIsPersonal ? ' · your pasted list is the baseline and is excluded from the sample' : '';
+  $('#dataNote').innerHTML = `<strong>${analysis.decks.length} sampled lists</strong> · window set to ${range.value} days${personalNote}${historicalNote} · ${analysis.data.note} · <a href="${analysis.data.sourceUrl}" target="_blank" rel="noreferrer">View source snapshot ↗</a>`;
   $('#summaryGrid').innerHTML = [[analysis.decks.length,'sampled lists'],[analysis.core.length,'backbone cards'],[flexInBase,'flex slots in baseline'],[totalCards,'cards indexed']].map(([value,label])=>`<div class="stat"><div class="stat-value">${value}</div><div class="stat-label">${label}</div></div>`).join('');
   $('#coreCards').innerHTML = analysis.core.map(([name, info]) => `<span class="signal-card" data-card-name="${name}" tabindex="0">${name}<b>${info.appearances}/${analysis.decks.length}</b></span>`).join('') || '<p>No shared nonland cards in the current sample.</p>';
   const packageGroups = analysis.variants.sort((a,b)=>b[1].appearances-a[1].appearances).slice(0,4);
@@ -608,8 +733,8 @@ function renderExperiments(analysis) {
     .filter(([name]) => !baseCards.includes(name) && primaryCardType(name) !== 'land')
     .sort((a,b)=>b[1].appearances-a[1].appearances);
   const cuts = baseCards
-    .filter(card => !isLand(card) && analysis.totals[card].appearances < analysis.threshold)
-    .sort((a,b)=>analysis.totals[a].appearances-analysis.totals[b].appearances);
+    .filter(card => !isLand(card) && (analysis.totals[card]?.appearances || 0) < analysis.threshold)
+    .sort((a,b)=>(analysis.totals[a]?.appearances || 0)-(analysis.totals[b]?.appearances || 0));
   const template = $('#experimentTemplate'); const target = $('#experiments'); target.innerHTML = '';
   const usedCuts = new Set();
   const experiments = candidates.map(([name, info]) => {
@@ -641,7 +766,7 @@ function renderExperiments(analysis) {
   });
   if (!experiments.length) target.innerHTML = '<p class="package-info">No role-compatible swaps are present in the sample. Add more source lists to broaden the search.</p>';
 }
-function render() { const analysis = getAnalysis(); updateCardLabLink(analysis); renderDeck(analysis); renderAnalysis(analysis); renderExperiments(analysis); bindCardPreviews(); }
+function render() { const analysis = getAnalysis(); updateCardLabLink(analysis); renderDeck(analysis); renderAnalysis(analysis); renderExperiments(analysis); bindDeckBoardTabs(); bindCardPreviews(); }
 selectArchetype.addEventListener('change', async () => {
   updateDeckChoices();
   try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
@@ -657,6 +782,9 @@ supplementLimit.addEventListener('change', loadLiveData);
 moxfieldEnabled.addEventListener('change', loadLiveData);
 importSavedHtml.addEventListener('click', () => savedHtmlFiles.click());
 savedHtmlFiles.addEventListener('change', () => importSavedHtmlPages(savedHtmlFiles.files));
+addOwnList.addEventListener('click', openOwnListDialog);
+ownListForm.addEventListener('submit', addPersonalDeck);
+$('#closeOwnList').addEventListener('click', () => ownListDialog.close());
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', () => loadLiveData({ forceRefresh: true }));
 $('#aboutButton').addEventListener('click', () => $('#aboutDialog').showModal());
