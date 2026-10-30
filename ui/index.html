@@ -90,6 +90,7 @@
             <span class="deck-meta" id="baselineMeta"></span>
           </div>
           <a class="baseline-card-lab-button" id="baselineCardLabLink" href="./card-lab.html"><span class="baseline-card-lab-label">Explore this deck in Card Lab</span><span class="baseline-card-lab-arrow">→</span></a>
+          <button class="edit-personal-list" id="editPersonalList" type="button" hidden>Edit this personal list</button>
           <div id="deckList" class="deck-list"></div>
         </div>
 
@@ -150,14 +151,14 @@
     <dialog id="ownListDialog" class="own-list-dialog">
       <button class="close-button" id="closeOwnList" aria-label="Close">×</button>
       <p class="eyebrow">YOUR BASELINE</p>
-      <h2>Paste your decklist</h2>
-      <p>Use one card per line, such as <code>4 Arclight Phoenix</code>. Add a line containing <code>Sideboard</code> to include your 15.</p>
+      <h2 id="ownListDialogTitle">Paste your decklist</h2>
+      <p id="ownListDialogHelp">Use one card per line, such as <code>4 Arclight Phoenix</code>. Add a line containing <code>Sideboard</code> to include your 15.</p>
       <form id="ownListForm">
         <label class="own-list-field" for="ownListName">Deck name <span>optional</span><input id="ownListName" maxlength="80" placeholder="My Izzet Phoenix" /></label>
         <label class="own-list-field" for="ownListArchetype">Compare against archetype<select id="ownListArchetype"></select></label>
         <label class="own-list-field" for="ownListText">Decklist<textarea id="ownListText" required spellcheck="false" placeholder="4 Arclight Phoenix&#10;4 Consider&#10;…&#10;&#10;Sideboard&#10;2 Mystical Dispute"></textarea></label>
         <p id="ownListError" class="own-list-error" role="alert" hidden></p>
-        <button class="primary-button" type="submit">Use as my baseline <span>→</span></button>
+        <button class="primary-button" id="saveOwnList" type="submit">Use as my baseline <span>→</span></button>
       </form>
     </dialog>
 

@@ -48,6 +48,7 @@ const addOwnList = document.querySelector('#addOwnList');
 const ownListDialog = document.querySelector('#ownListDialog');
 const ownListForm = document.querySelector('#ownListForm');
 const ownListArchetype = document.querySelector('#ownListArchetype');
+const editPersonalList = document.querySelector('#editPersonalList');
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const fallbackIsLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
@@ -59,6 +60,7 @@ let currentPreviewName = '';
 let loadingMessageTimer;
 const MIN_LOADING_FEEDBACK_MS = 800;
 let archetypeLoadToken = 0;
+let editingPersonalDeckIndex = null;
 const importedDecks = [];
 const PERSONAL_DECKS_STORAGE_KEY = 'delver-personal-decks-v1';
 const personalDecks = (() => {
@@ -357,10 +359,29 @@ async function importSavedHtmlPages(files) {
   }
 }
 
-function openOwnListDialog() {
+function decklistText(cards, sideboard = {}) {
+  const formatBoard = board => Object.entries(board)
+    .sort(([first], [second]) => first.localeCompare(second))
+    .map(([name, quantity]) => `${quantity} ${name}`)
+    .join('\n');
+  const mainboard = formatBoard(cards);
+  const sideboardText = formatBoard(sideboard);
+  return sideboardText ? `${mainboard}\n\nSideboard\n${sideboardText}` : mainboard;
+}
+
+function openOwnListDialog(personalDeckIndex = null) {
+  editingPersonalDeckIndex = personalDeckIndex;
   ownListArchetype.innerHTML = '';
   Object.keys(datasets).sort().forEach(name => ownListArchetype.add(new Option(name, name)));
-  ownListArchetype.value = selectArchetype.value;
+  const deck = Number.isInteger(personalDeckIndex) ? personalDecks[personalDeckIndex] : null;
+  ownListArchetype.value = deck?.archetype || selectArchetype.value;
+  $('#ownListName').value = deck?.name || '';
+  $('#ownListText').value = deck ? decklistText(deck.cards, deck.sideboard) : '';
+  $('#ownListDialogTitle').textContent = deck ? 'Edit your decklist' : 'Paste your decklist';
+  $('#ownListDialogHelp').innerHTML = deck
+    ? 'Your saved mainboard is loaded below. Add or update a <code>Sideboard</code> section, then save it back.'
+    : 'Use one card per line, such as <code>4 Arclight Phoenix</code>. Add a line containing <code>Sideboard</code> to include your 15.';
+  $('#saveOwnList').innerHTML = deck ? 'Save my updated list <span>→</span>' : 'Use as my baseline <span>→</span>';
   $('#ownListError').hidden = true;
   ownListDialog.showModal();
   $('#ownListName').focus();
@@ -391,15 +412,18 @@ async function addPersonalDeck(event) {
     sourceUrl: '',
     personal: true,
   };
-  personalDecks.push(personalDeck);
+  const isEditing = Number.isInteger(editingPersonalDeckIndex);
+  if (isEditing) personalDecks[editingPersonalDeckIndex] = personalDeck;
+  else personalDecks.push(personalDeck);
   savePersonalDecks();
-  const personalIndex = personalDecks.length - 1;
+  const personalIndex = isEditing ? editingPersonalDeckIndex : personalDecks.length - 1;
   if (selectArchetype.value !== archetype) selectArchetype.value = archetype;
   updateDeckChoices();
   selectDeck.value = `own:${personalIndex}`;
   try { await ensureCardProfiles(archetype); } catch (error) { console.warn(error.message); }
   render();
   ownListForm.reset();
+  editingPersonalDeckIndex = null;
   ownListDialog.close();
 }
 
@@ -653,6 +677,7 @@ function renderDeck(analysis) {
   const { base, totals, threshold } = analysis;
   $('#baselineTitle').textContent = base.name;
   $('#baselineMeta').innerHTML = `${base.finish}<br>${base.date}${base.player ? `<br>${base.player}` : ''}`;
+  editPersonalList.hidden = !analysis.baseIsPersonal;
   const sectionOrder = ['Creatures', 'Planeswalkers', 'Instants', 'Sorceries', 'Artifacts', 'Enchantments', 'Other spells', 'Lands'];
   const sectionForType = {
     creature: 'Creatures', planeswalker: 'Planeswalkers', instant: 'Instants', sorcery: 'Sorceries',
@@ -782,9 +807,13 @@ supplementLimit.addEventListener('change', loadLiveData);
 moxfieldEnabled.addEventListener('change', loadLiveData);
 importSavedHtml.addEventListener('click', () => savedHtmlFiles.click());
 savedHtmlFiles.addEventListener('change', () => importSavedHtmlPages(savedHtmlFiles.files));
-addOwnList.addEventListener('click', openOwnListDialog);
+addOwnList.addEventListener('click', () => openOwnListDialog());
 ownListForm.addEventListener('submit', addPersonalDeck);
-$('#closeOwnList').addEventListener('click', () => ownListDialog.close());
+editPersonalList.addEventListener('click', () => {
+  const match = selectDeck.value.match(/^own:(\d+)$/);
+  if (match) openOwnListDialog(Number(match[1]));
+});
+$('#closeOwnList').addEventListener('click', () => { editingPersonalDeckIndex = null; ownListDialog.close(); });
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', () => loadLiveData({ forceRefresh: true }));
 $('#aboutButton').addEventListener('click', () => $('#aboutDialog').showModal());
