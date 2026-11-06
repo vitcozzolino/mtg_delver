@@ -16,6 +16,7 @@ dependencies = [
 delver = "dev:main"
 load-mtgdecks = "loaders.runner:mtgdecks"
 load-aetherhub = "loaders.runner:aetherhub"
+load-magic4ever = "loaders.runner:magic4ever"
 
 [build-system]
 requires = ["setuptools>=61"]

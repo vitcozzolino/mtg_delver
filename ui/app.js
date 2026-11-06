@@ -49,6 +49,8 @@ const ownListDialog = document.querySelector('#ownListDialog');
 const ownListForm = document.querySelector('#ownListForm');
 const ownListArchetype = document.querySelector('#ownListArchetype');
 const editPersonalList = document.querySelector('#editPersonalList');
+const deckNotes = document.querySelector('#deckNotes');
+const deckNotesStatus = document.querySelector('#deckNotesStatus');
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const fallbackIsLand = (name) => /Forest|Island|Plains|Mountain|Swamp|Fountain|Beach|Field|Anchorage|Nykthos|Hydra|Boseiju|Otawara|Eiganjo|Canal|Vents|Pathway|Coast|Reef|Verge|Tomb|Sanctum|Courtyard|Ruins|Den|Castle|Cottage|Passage|Harbor|Garden|Catacomb|Cemetery|Fastland|Lair|Port|Mine|Temple|Shock|Triome/.test(name);
@@ -60,9 +62,11 @@ let currentPreviewName = '';
 let loadingMessageTimer;
 const MIN_LOADING_FEEDBACK_MS = 800;
 let archetypeLoadToken = 0;
+let liveLoadToken = 0;
 let editingPersonalDeckIndex = null;
 const importedDecks = [];
 const PERSONAL_DECKS_STORAGE_KEY = 'delver-personal-decks-v1';
+const DECK_NOTES_STORAGE_PREFIX = 'delver-deck-notes-v1:';
 const personalDecks = (() => {
   try {
     const saved = JSON.parse(localStorage.getItem(PERSONAL_DECKS_STORAGE_KEY) || '[]');
@@ -74,6 +78,30 @@ const personalDecks = (() => {
 
 function savePersonalDecks() {
   try { localStorage.setItem(PERSONAL_DECKS_STORAGE_KEY, JSON.stringify(personalDecks)); } catch (error) { console.warn('Could not save personal decklists locally', error); }
+}
+
+function notesStorageKey(analysis) {
+  const identity = analysis.baseIsPersonal ? `personal:${analysis.personalIndex}` : `sample:${deckKey(analysis.base)}`;
+  return `${DECK_NOTES_STORAGE_PREFIX}${identity}`;
+}
+
+function loadDeckNotes(analysis) {
+  const key = notesStorageKey(analysis);
+  deckNotes.dataset.storageKey = key;
+  try { deckNotes.value = localStorage.getItem(key) || ''; } catch { deckNotes.value = ''; }
+  deckNotesStatus.textContent = 'Saved locally';
+}
+
+function saveDeckNotes() {
+  const key = deckNotes.dataset.storageKey;
+  if (!key) return;
+  try {
+    localStorage.setItem(key, deckNotes.value);
+    deckNotesStatus.textContent = 'Saved locally';
+  } catch (error) {
+    console.warn('Could not save deck notes locally', error);
+    deckNotesStatus.textContent = 'Could not save';
+  }
 }
 
 function profileFor(name) { return cardProfiles.get(name); }
@@ -162,6 +190,16 @@ function setLoading(isLoading, title = 'Loading current decklists', detail = 'Co
     messageIndex = (messageIndex + 1) % messages.length;
     $('#loadingDetail').textContent = messages[messageIndex];
   }, 1800);
+}
+
+function setBackgroundSync(isSyncing, detail = 'Refreshing tournament data in the background…') {
+  const progress = $('#syncProgress');
+  const refresh = $('#refreshData');
+  progress.hidden = !isSyncing;
+  document.body.classList.toggle('is-background-syncing', isSyncing);
+  refresh.disabled = isSyncing;
+  refresh.classList.toggle('is-spinning', isSyncing);
+  if (isSyncing) $('#syncProgressLabel').textContent = detail;
 }
 
 function parseDeckSections(deckText, sideboardText = '') {
@@ -495,9 +533,18 @@ async function enrichArchetype(archetype, days, { showLoading = false, forceRefr
   }
 }
 async function loadLiveData({ forceRefresh = false } = {}) {
+  const loadToken = ++liveLoadToken;
   const loadingStartedAt = Date.now();
-  setLoading(true, 'Refreshing Pioneer intelligence', 'Fetching recent MTGO and tournament decklists…');
-  $('#dataStatus').innerHTML = '<span class="status-dot is-loading"></span> Updating Pioneer data…';
+  const background = Object.keys(datasets).length > 0;
+  const previousArchetype = selectArchetype.value;
+  const previousDeck = selectDeck.value;
+  if (background) {
+    setBackgroundSync(true, 'Refreshing primary tournament sources… showing the current sample.');
+    $('#dataStatus').innerHTML = '<span class="status-dot is-loading"></span> Pioneer · refreshing in background…';
+  } else {
+    setLoading(true, 'Refreshing Pioneer intelligence', 'Fetching recent MTGO and tournament decklists…');
+    $('#dataStatus').innerHTML = '<span class="status-dot is-loading"></span> Updating Pioneer data…';
+  }
   try {
     let feed;
     let sourceName = 'MTGO / Videre Project feed';
@@ -508,10 +555,16 @@ async function loadLiveData({ forceRefresh = false } = {}) {
       const response = await fetch(`${TOPDECK_FEED_URL}?days=${range.value}${refresh}`, { cache: 'no-store' });
       if (!response.ok) throw new Error('TopDeck is not configured');
       feed = await response.json();
-      if (feed.source === 'videre-spicerack') {
+      if (loadToken !== liveLoadToken) return;
+      if (feed.source === 'videre-spicerack' || feed.source === 'videre-spicerack-magic4ever') {
         const activeSources = new Set(feed.active_sources || []);
-        sourceName = activeSources.has('spicerack') ? 'Videre MTGO + Spicerack' : 'Videre MTGO';
-        sourceUrl = 'https://www.videreproject.com/';
+        const sourceCounts = feed.source_counts || {};
+        const labels = [];
+        if (activeSources.has('videre')) labels.push(`Videre MTGO${sourceCounts.videre ? ` (${sourceCounts.videre})` : ''}`);
+        if (activeSources.has('spicerack')) labels.push(`Spicerack${sourceCounts.spicerack ? ` (${sourceCounts.spicerack})` : ''}`);
+        if (activeSources.has('magic4ever-local')) labels.push(`Magic4Ever${sourceCounts['magic4ever-local'] ? ` (${sourceCounts['magic4ever-local']})` : ''}`);
+        sourceName = labels.join(' + ') || 'Pioneer tournament sources';
+        sourceUrl = activeSources.has('magic4ever-local') ? 'https://www.magic4ever.com/pioneer/' : 'https://www.videreproject.com/';
       } else {
         sourceName = 'TopDeck.gg API';
         sourceUrl = 'https://topdeck.gg';
@@ -521,7 +574,12 @@ async function loadLiveData({ forceRefresh = false } = {}) {
       const response = await fetch(PUBLIC_FEED_URL, { cache: 'no-store' });
       if (!response.ok) throw new Error(`Public feed responded ${response.status}`);
       feed = await response.json();
+      if (loadToken !== liveLoadToken) return;
     }
+    // Respect any deck/archetype selection the user made while this refresh
+    // was running in the background.
+    const selectedArchetypeAtSwap = selectArchetype.value;
+    const selectedDeckAtSwap = selectDeck.value;
     datasets = buildLiveDatasets(feed);
     mergeImportedDecks();
     if (!Object.keys(datasets).length) throw new Error('No usable Pioneer lists returned');
@@ -531,15 +589,37 @@ async function loadLiveData({ forceRefresh = false } = {}) {
     const cacheNote = feed.cache?.status === 'hit' ? ' · served from local cache' : feed.cache?.status === 'stale' ? ' · showing stale local cache (source refresh failed)' : '';
     Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${cacheNote}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
     $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}${feed.cache?.status === 'hit' ? ' · cached' : ''}`;
-    populateArchetypes('Izzet Phoenix');
+    const preferredArchetype = datasets[selectedArchetypeAtSwap]
+      ? selectedArchetypeAtSwap
+      : datasets[previousArchetype] ? previousArchetype : 'Izzet Phoenix';
+    populateArchetypes(preferredArchetype);
+    const preferredDeck = selectedDeckAtSwap || previousDeck;
+    if ([...selectDeck.options].some(option => option.value === preferredDeck)) selectDeck.value = preferredDeck;
+    // Draw the fresh primary sample immediately. Card profiles and smaller
+    // supplements can arrive afterward without freezing the existing view.
+    render();
+    if (background) $('#syncProgressLabel').textContent = 'Primary sample updated · enriching card data and supplemental sources…';
+    try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
+    render();
     await enrichArchetype(selectArchetype.value, Number(range.value), { forceRefresh });
+    if (loadToken !== liveLoadToken) return;
     try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
     render();
   } catch (error) {
-    $('#dataStatus').innerHTML = '<span class="status-dot"></span> Pioneer · feed unavailable';
-    $('#dataNote').textContent = `Couldn’t load the live feed: ${error.message}. Refresh to retry.`;
-    $('#summaryGrid').innerHTML = '';
+    if (loadToken !== liveLoadToken) return;
+    if (background) {
+      $('#dataStatus').innerHTML = '<span class="status-dot"></span> Pioneer · refresh failed · showing previous sample';
+    } else {
+      $('#dataStatus').innerHTML = '<span class="status-dot"></span> Pioneer · feed unavailable';
+      $('#dataNote').textContent = `Couldn’t load the live feed: ${error.message}. Refresh to retry.`;
+      $('#summaryGrid').innerHTML = '';
+    }
   } finally {
+    if (loadToken !== liveLoadToken) return;
+    if (background) {
+      setBackgroundSync(false);
+      return;
+    }
     const remainingFeedbackTime = MIN_LOADING_FEEDBACK_MS - (Date.now() - loadingStartedAt);
     if (remainingFeedbackTime > 0) await new Promise(resolve => setTimeout(resolve, remainingFeedbackTime));
     setLoading(false);
@@ -671,13 +751,14 @@ function getAnalysis() {
   const threshold = Math.ceil(decks.length * .67);
   const core = Object.entries(totals).filter(([card,info]) => info.appearances >= threshold && !isLand(card)).sort((a,b) => b[1].appearances - a[1].appearances || b[1].copies-a[1].copies);
   const variants = Object.entries(totals).filter(([card,info]) => info.appearances > 0 && info.appearances < threshold && !isLand(card));
-  return { data, base, decks, totals, core, variants, threshold, baseIsPersonal: Boolean(ownMatch) };
+  return { data, base, decks, totals, core, variants, threshold, baseIsPersonal: Boolean(ownMatch), personalIndex: ownMatch ? Number(ownMatch[1]) : null };
 }
 function renderDeck(analysis) {
   const { base, totals, threshold } = analysis;
   $('#baselineTitle').textContent = base.name;
   $('#baselineMeta').innerHTML = `${base.finish}<br>${base.date}${base.player ? `<br>${base.player}` : ''}`;
   editPersonalList.hidden = !analysis.baseIsPersonal;
+  loadDeckNotes(analysis);
   const sectionOrder = ['Creatures', 'Planeswalkers', 'Instants', 'Sorceries', 'Artifacts', 'Enchantments', 'Other spells', 'Lands'];
   const sectionForType = {
     creature: 'Creatures', planeswalker: 'Planeswalkers', instant: 'Instants', sorcery: 'Sorceries',
@@ -813,6 +894,7 @@ editPersonalList.addEventListener('click', () => {
   const match = selectDeck.value.match(/^own:(\d+)$/);
   if (match) openOwnListDialog(Number(match[1]));
 });
+deckNotes.addEventListener('input', saveDeckNotes);
 $('#closeOwnList').addEventListener('click', () => { editingPersonalDeckIndex = null; ownListDialog.close(); });
 $('#analyzeButton').addEventListener('click', render);
 $('#refreshData').addEventListener('click', () => loadLiveData({ forceRefresh: true }));

@@ -16,3 +16,8 @@ def mtgdecks() -> None:
 def aetherhub() -> None:
     """Run the interactive AetherHub loader through ``uv run load-aetherhub``."""
     _run("aetherhub.py")
+
+
+def magic4ever() -> None:
+    """Normalize Magic4Ever's Pioneer export through ``uv run load-magic4ever``."""
+    _run("magic4ever.py")

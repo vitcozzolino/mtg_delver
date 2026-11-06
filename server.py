@@ -62,6 +62,7 @@ CHATGPT_AUTH_STORE = ROOT / ".delver-chatgpt-auth.json"
 CHATGPT_REDIRECT_URI = "http://127.0.0.1:8080/api/chatgpt/callback"
 MAX_ARCHETYPE_DECKS = 20
 LOCAL_DECK_ARCHIVE = ROOT / "output" / "mtgdecks" / "decklists.zip"
+LOCAL_MAGIC4EVER_ARCHIVE = ROOT / "output" / "magic4ever" / "decklists.json"
 # MTGTop8 does not publish an API or rate-limit guidance. Keep every live
 # lookup intentionally small, serial, and cache-first.
 MTG_TOP8_REQUEST_DELAY_SECONDS = 0.75
@@ -712,6 +713,54 @@ def fetch_local_phoenix_archive() -> dict:
             "decks": decks,
         }],
     }
+
+
+def fetch_local_magic4ever(days: int) -> list[dict]:
+    """Read every recent list produced by the local Magic4Ever loader.
+
+    Magic4Ever is a primary tournament source once its local export has been
+    normalized. The loader owns access to the upstream text export; serving
+    the cached JSON here makes app refreshes fast and network-free.
+    """
+    if not LOCAL_MAGIC4EVER_ARCHIVE.is_file():
+        raise RuntimeError("Magic4Ever archive not found. Run `uv run load-magic4ever` first.")
+    try:
+        payload = json.loads(LOCAL_MAGIC4EVER_ARCHIVE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Magic4Ever archive could not be read: {error}") from error
+    records = payload.get("decks") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise RuntimeError("Magic4Ever archive has no normalized decklists.")
+    cutoff = datetime.now(timezone.utc).date().fromordinal(datetime.now(timezone.utc).date().toordinal() - days)
+    decks: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        deck_text = to_deck_text(str(record.get("deck_text") or ""))
+        if not deck_text:
+            continue
+        date = str(record.get("date") or "")[:10]
+        try:
+            if datetime.fromisoformat(date).date() < cutoff:
+                continue
+        except ValueError:
+            continue
+        decks.append({
+            "number": str(record.get("id") or ""),
+            "date": date,
+            "event": str(record.get("event") or "Magic4Ever Pioneer event"),
+            "result": str(record.get("result") or "Published list"),
+            "player": str(record.get("player") or "Unknown player"),
+            "archetype": str(record.get("archetype") or "Unknown"),
+            "source": "magic4ever-local",
+            "format": "pioneer",
+            "deck_text": deck_text,
+            "sideboard_text": to_deck_text(str(record.get("sideboard_text") or "")),
+            "source_url": str(record.get("source_url") or "https://www.magic4ever.com/pioneer/"),
+        })
+    if not decks:
+        raise RuntimeError(f"Magic4Ever archive has no decklists in the last {days} days.")
+    return decks
 
 
 def card_profile_from_scryfall(card: object) -> dict:
@@ -2065,13 +2114,17 @@ def videre_mainboard(lines: object) -> str:
     cards: list[str] = []
     pattern = re.compile(r'^\(\d+,(?:"([^"]+)"|([^,]+)),(\d+)\)$')
     for line in lines:
-        if not isinstance(line, str):
+        if isinstance(line, dict):
+            name = str(line.get("name") or "").strip()
+            quantity = line.get("quantity")
+            if name and isinstance(quantity, int) and quantity > 0:
+                cards.append(f"{quantity} {name}")
             continue
-        match = pattern.match(line)
-        if not match:
-            continue
-        name = (match.group(1) or match.group(2)).strip()
-        cards.append(f"{match.group(3)} {name}")
+        if isinstance(line, str):
+            match = pattern.match(line.strip())
+            if match:
+                name = (match.group(1) or match.group(2)).strip()
+                cards.append(f"{match.group(3)} {name}")
     return "\n".join(cards)
 
 
@@ -2106,7 +2159,9 @@ def fetch_videre(days: int) -> list[dict]:
                 "event": row.get("event_name") or "Magic Online event",
                 "result": row.get("event_type") or "Published MTGO list",
                 "player": row.get("player") or "Unknown player",
-                "archetype": row.get("archetype") or row.get("deck_name") or "Unknown",
+                "archetype": normalized_archetype(
+                    row.get("archetype") or row.get("deck_name"), deck_text
+                ),
                 "source": "videre",
                 "format": "pioneer",
                 "deck_text": deck_text,
@@ -2130,6 +2185,10 @@ def infer_archetype(deck_text: str) -> str:
     cards = deck_text.lower()
     if "arclight phoenix" in cards:
         return "Izzet Phoenix"
+    if "eddymurk crab" in cards and "sunderflock" in cards:
+        return "Izzet Prowess"
+    if "vivi ornitier" in cards and "proft's eidetic memory" in cards:
+        return "Izzet Midrange"
     if "nykthos, shrine to nyx" in cards and "kiora, behemoth beckoner" in cards:
         return "Mono-Green Devotion"
     if "greasefang, okiba boss" in cards and "parhelion ii" in cards:
@@ -2137,6 +2196,15 @@ def infer_archetype(deck_text: str) -> str:
     if "lotus field" in cards and "hidden strings" in cards:
         return "Lotus Field"
     return "Unknown"
+
+
+def normalized_archetype(label: object, deck_text: str) -> str:
+    """Replace opaque color labels only when a deck has a clear shell marker."""
+    name = str(label or "").strip()
+    if name.casefold() not in {"ur", "u/r", "izzet", "unknown"}:
+        return name or infer_archetype(deck_text)
+    inferred = infer_archetype(deck_text)
+    return inferred if inferred != "Unknown" else name or "Unknown"
 
 
 def fetch_spicerack(days: int) -> list[dict]:
@@ -2164,7 +2232,7 @@ def fetch_spicerack(days: int) -> list[dict]:
                 "event": tournament.get("tournamentName") or "Spicerack tournament",
                 "result": f"#{standing} · {wins}-{losses}",
                 "player": row.get("name") or "Unknown player",
-                "archetype": row.get("archetype") or infer_archetype(deck_text),
+                "archetype": normalized_archetype(row.get("archetype"), deck_text),
                 "source": "spicerack",
                 "format": "pioneer",
                 "deck_text": deck_text,
@@ -2177,7 +2245,14 @@ def deduplicate(decks: list[dict]) -> list[dict]:
     seen: set[str] = set()
     unique: list[dict] = []
     for deck in decks:
-        fingerprint = "\n".join(sorted(line.strip().lower() for line in deck["deck_text"].splitlines() if line.strip()))
+        # Magic4Ever's export is tournament evidence: identical 75s from
+        # different pilots/events are separate results and must remain in the
+        # sample. Other live sources retain the historical cross-source
+        # mainboard de-duplication behaviour.
+        if deck.get("source") == "magic4ever-local":
+            fingerprint = f"magic4ever:{deck.get('number') or deck.get('date')}"
+        else:
+            fingerprint = "\n".join(sorted(line.strip().lower() for line in deck["deck_text"].splitlines() if line.strip()))
         if not fingerprint or fingerprint in seen:
             continue
         seen.add(fingerprint)
@@ -2186,9 +2261,9 @@ def deduplicate(decks: list[dict]) -> list[dict]:
 
 
 def fetch_pioneer_sources(days: int, *, force_refresh: bool = False) -> dict:
-    """Merge evidence-grade MTGO and paper tournament lists without a single-source dependency."""
+    """Merge primary MTGO and paper tournament lists without a single-source dependency."""
     return cached_fetch(
-        f"pioneer:v2:{days}",
+        f"pioneer:v5:{days}",
         SOURCE_CACHE_TTL_SECONDS,
         lambda: fetch_pioneer_sources_live(days),
         force_refresh=force_refresh,
@@ -2196,7 +2271,11 @@ def fetch_pioneer_sources(days: int, *, force_refresh: bool = False) -> dict:
 
 
 def fetch_pioneer_sources_live(days: int) -> dict:
-    sources = {"Videre MTGO": fetch_videre, "Spicerack": fetch_spicerack}
+    sources = {
+        "Videre MTGO": fetch_videre,
+        "Spicerack": fetch_spicerack,
+        "Magic4Ever": fetch_local_magic4ever,
+    }
     decks: list[dict] = []
     errors: list[str] = []
     with ThreadPoolExecutor(max_workers=len(sources)) as executor:
@@ -2210,6 +2289,10 @@ def fetch_pioneer_sources_live(days: int) -> dict:
     decks = deduplicate(decks)
     if not decks:
         raise RuntimeError("; ".join(errors) or "No Pioneer tournament decklists returned")
+    source_counts: dict[str, int] = {}
+    for deck in decks:
+        source = str(deck.get("source") or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
     events = [{
         "id": "pioneer-evidence-sample",
         "url": "https://www.videreproject.com/",
@@ -2225,11 +2308,12 @@ def fetch_pioneer_sources_live(days: int) -> dict:
         "kind": "pioneer_multi_source_decklists",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "format": "pioneer",
-        "source": "videre-spicerack",
+        "source": "videre-spicerack-magic4ever",
         "days": days,
         "events": events,
         "warnings": errors,
         "active_sources": sorted({deck["source"] for deck in decks}),
+        "source_counts": source_counts,
     }
     return payload
 

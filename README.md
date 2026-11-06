@@ -14,9 +14,9 @@ A no-build Pioneer deck explorer: a plain JavaScript frontend with a small local
 
 By default, the live loader fetches `data/latest/mtgo-decklists/pioneer.json` from the source's `data-publish` branch. The feed includes published MTGO deck text, player, event, result, archetype, and date; it currently exposes a seven-day window. The app filters to archetypes with at least two usable mainboards and treats each source update as a fresh snapshot.
 
-## Live sources: Videre + Spicerack
+## Primary sources: Videre + Spicerack + Magic4Ever
 
-The default backend now merges two evidence-grade sources: Videre's public MTGO deck API and Spicerack's public completed-tournament decklist API. It requests the selected 1–90 day Pioneer window, de-duplicates identical mainboards, and preserves each list's source URL. A temporarily slow or unavailable source is recorded as a warning without blocking results from the other source.
+The default backend merges Videre's public MTGO deck API, Spicerack's public completed-tournament decklist API, and the local normalized Magic4Ever Pioneer export. It requests the selected 1–90 day window, de-duplicates identical mainboards, and preserves each list's source URL. A temporarily slow or unavailable source is recorded as a warning without blocking results from the other sources.
 
 For the selected archetype, Delver also loads capped, cached supplemental lists from MTG Decklists, MTGContent's public Pioneer search, and MTGTop8's public Pioneer archetype pages. Source labels remain visible and identical decks are de-duplicated before comparison.
 
@@ -49,9 +49,12 @@ Run each resumable loader through its dedicated uv command:
 ```bash
 uv run load-mtgdecks
 uv run load-aetherhub
+uv run load-magic4ever
 ```
 
-`load-mtgdecks` writes to `output/mtgdecks/`; `load-aetherhub` writes to `output/aetherhub/` and opens an interactive Playwright browser. Do not run either loader concurrently with another instance of itself, since each source owns a single progress file.
+`load-mtgdecks` writes to `output/mtgdecks/`; `load-aetherhub` writes to `output/aetherhub/` and opens an interactive Playwright browser; `load-magic4ever` reads the browser-assisted raw export at `output/magic4ever/pioneer_decklists.txt` and writes every normalized tournament list to `output/magic4ever/decklists.json` and `.zip`.
+
+Magic4Ever is a **primary** local tournament source, not a capped supplement: every recent normalized list is included in the Pioneer sample. Its export does not supply an archetype field per list, so Delver applies conservative shell recognition; lists it cannot label remain stored as `Unknown` rather than being thrown away. To replace the raw export from Magic4Ever's published text URL when access permits, run `uv run load-magic4ever --refresh`. The loader never attempts to bypass an access challenge.
 
 ## Moxfield community lists (optional)
 
@@ -85,7 +88,7 @@ After that, starting the Python backend needs no export or key entry:
 uv run delver
 ```
 
-Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. `uv run delver` watches Python, HTML, CSS, JavaScript, and `pyproject.toml`, restarting the local server whenever they change; caches and loader output are ignored. The recency slider uses 1–90 days. The UI visibly credits the active data source. The key remains local for optional TopDeck support, but the default Pioneer sample is now Videre + Spicerack because TopDeck currently exposes too few public Pioneer decklists.
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080), rather than opening `index.html` as a file. `uv run delver` watches Python, HTML, CSS, JavaScript, and `pyproject.toml`, restarting the local server whenever they change; caches and loader output are ignored. The recency slider uses 1–90 days. The UI visibly credits the active data source. The key remains local for optional TopDeck support, but the default Pioneer sample is Videre + Spicerack + the locally normalized Magic4Ever export because TopDeck currently exposes too few public Pioneer decklists.
 
 The frontend remains plain HTML, CSS, and JavaScript. Python is only the local API server that keeps the TopDeck key out of the browser. `uv` creates an isolated `.venv` and locks the project in `uv.lock`; the optional local loaders use `requests`, Beautiful Soup, and Playwright. TopDeck only contributes completed events with public decklists; when it has no usable Pioneer lists, the UI visibly falls back to the public MTGO feed. Never commit a real key; `.env.example` is only a naming reference.
 

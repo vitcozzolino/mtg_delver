@@ -92,6 +92,17 @@
           <a class="baseline-card-lab-button" id="baselineCardLabLink" href="./card-lab.html"><span class="baseline-card-lab-label">Explore this deck in Card Lab</span><span class="baseline-card-lab-arrow">→</span></a>
           <button class="edit-personal-list" id="editPersonalList" type="button" hidden>Edit this personal list</button>
           <div id="deckList" class="deck-list"></div>
+          <section class="deck-clipboard" aria-labelledby="deckClipboardTitle">
+            <div class="deck-clipboard-heading">
+              <div>
+                <p class="eyebrow">DECK CLIPBOARD</p>
+                <h3 id="deckClipboardTitle">Notes &amp; ideas</h3>
+              </div>
+              <span id="deckNotesStatus" role="status" aria-live="polite">Saved locally</span>
+            </div>
+            <textarea id="deckNotes" spellcheck="true" placeholder="Matchup observations, cards to test, sideboard plans, questions for later…"></textarea>
+            <p>Your notes stay in this browser and are attached to this deck.</p>
+          </section>
         </div>
 
         <div class="panel insights-panel">
