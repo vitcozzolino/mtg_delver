@@ -17,11 +17,12 @@ delver = "dev:main"
 load-mtgdecks = "loaders.runner:mtgdecks"
 load-aetherhub = "loaders.runner:aetherhub"
 load-magic4ever = "loaders.runner:magic4ever"
+build-snapshot = "snapshot:main"
 
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["server", "dev"]
+py-modules = ["server", "dev", "snapshot"]
 packages = ["loaders"]

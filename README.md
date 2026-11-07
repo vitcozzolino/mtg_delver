@@ -56,6 +56,20 @@ uv run load-magic4ever
 
 Magic4Ever is a **primary** local tournament source, not a capped supplement: every recent normalized list is included in the Pioneer sample. Its export does not supply an archetype field per list, so Delver applies conservative shell recognition; lists it cannot label remain stored as `Unknown` rather than being thrown away. To replace the raw export from Magic4Ever's published text URL when access permits, run `uv run load-magic4ever --refresh`. The loader never attempts to bypass an access challenge.
 
+## Published static snapshot (GitLab Pages)
+
+The repository can publish the Explorer itself and a committed snapshot of its current primary Pioneer sample to GitLab Pages. Build a fresh snapshot after updating the local Magic4Ever export:
+
+```bash
+uv run load-magic4ever
+uv run build-snapshot
+git add ui/data/pioneer-snapshot.json
+git commit -m "Publish Pioneer snapshot"
+git push
+```
+
+The Pages pipeline copies `ui/` to the static site. On a static host, the Explorer detects that `/api` is unavailable and uses `ui/data/pioneer-snapshot.json` automatically; the source status says **published snapshot** and includes its generation timestamp. The snapshot is intentionally frozen until it is rebuilt and pushed. Features requiring the Python API—live refresh, source supplements, Card Lab's AI review, and local credentials—still require a separately hosted backend.
+
 ## Moxfield community lists (optional)
 
 Delver can add a separate, filtered Moxfield community sample for the selected archetype. It is never presented as tournament evidence. Leave **Moxfield community lists** enabled in the page and set this read-only identifier in your local `.env` file:

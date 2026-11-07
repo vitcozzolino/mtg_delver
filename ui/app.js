@@ -37,6 +37,9 @@ const MTGTOP8_FEED_URL = '/api/mtgtop8';
 const LOCAL_PHOENIX_ARCHIVE_URL = '/api/local-phoenix-archive';
 const CARD_PROFILE_URL = '/api/card-profiles';
 const PUBLIC_FEED_URL = 'https://raw.githubusercontent.com/Pedrogush/MTGO_Tools_Data/data-publish/data/latest/mtgo-decklists/pioneer.json';
+// A committed data export lets the explorer remain useful on static hosts
+// (GitLab Pages has no Python process behind /api).
+const STATIC_SNAPSHOT_URL = './data/pioneer-snapshot.json';
 const selectArchetype = document.querySelector('#archetypeSelect');
 const selectDeck = document.querySelector('#deckSelect');
 const range = document.querySelector('#recencyRange');
@@ -550,6 +553,7 @@ async function loadLiveData({ forceRefresh = false } = {}) {
     let sourceName = 'MTGO / Videre Project feed';
     let sourceUrl = PUBLIC_FEED_URL;
     let fallbackReason = '';
+    let staticSnapshot = false;
     try {
       const refresh = forceRefresh ? '&refresh=1' : '';
       const response = await fetch(`${TOPDECK_FEED_URL}?days=${range.value}${refresh}`, { cache: 'no-store' });
@@ -570,11 +574,30 @@ async function loadLiveData({ forceRefresh = false } = {}) {
         sourceUrl = 'https://topdeck.gg';
       }
     } catch (error) {
-      fallbackReason = error.message || 'TopDeck was unavailable';
-      const response = await fetch(PUBLIC_FEED_URL, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`Public feed responded ${response.status}`);
-      feed = await response.json();
-      if (loadToken !== liveLoadToken) return;
+      try {
+        const response = await fetch(STATIC_SNAPSHOT_URL, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Published snapshot responded ${response.status}`);
+        feed = await response.json();
+        if (loadToken !== liveLoadToken) return;
+        staticSnapshot = true;
+      } catch (snapshotError) {
+        fallbackReason = error.message || 'Local API was unavailable';
+        const response = await fetch(PUBLIC_FEED_URL, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Public feed responded ${response.status}`);
+        feed = await response.json();
+        if (loadToken !== liveLoadToken) return;
+        console.warn('Published snapshot unavailable:', snapshotError.message);
+      }
+    }
+    if (staticSnapshot) {
+      const activeSources = new Set(feed.active_sources || []);
+      const sourceCounts = feed.source_counts || {};
+      const labels = [];
+      if (activeSources.has('videre')) labels.push(`Videre MTGO${sourceCounts.videre ? ` (${sourceCounts.videre})` : ''}`);
+      if (activeSources.has('spicerack')) labels.push(`Spicerack${sourceCounts.spicerack ? ` (${sourceCounts.spicerack})` : ''}`);
+      if (activeSources.has('magic4ever-local')) labels.push(`Magic4Ever${sourceCounts['magic4ever-local'] ? ` (${sourceCounts['magic4ever-local']})` : ''}`);
+      sourceName = labels.join(' + ') || 'Pioneer tournament sources';
+      sourceUrl = STATIC_SNAPSHOT_URL;
     }
     // Respect any deck/archetype selection the user made while this refresh
     // was running in the background.
@@ -583,12 +606,14 @@ async function loadLiveData({ forceRefresh = false } = {}) {
     datasets = buildLiveDatasets(feed);
     mergeImportedDecks();
     if (!Object.keys(datasets).length) throw new Error('No usable Pioneer lists returned');
-    range.min = 1; range.max = 90; range.value = feed.days;
-    $('#rangeOutput').textContent = `${feed.days} days`;
+    range.min = 1; range.max = 90; range.value = feed.days || range.value;
+    $('#rangeOutput').textContent = `${range.value} days`;
     const sourceWarnings = Array.isArray(feed.warnings) && feed.warnings.length ? ` · Source warnings: ${feed.warnings.join(' | ')}` : '';
     const cacheNote = feed.cache?.status === 'hit' ? ' · served from local cache' : feed.cache?.status === 'stale' ? ' · showing stale local cache (source refresh failed)' : '';
-    Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `Live ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(feed.generated_at)}${cacheNote}${fallbackReason ? ` · TopDeck fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
-    $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${fallbackReason ? 'public fallback' : sourceName}${feed.cache?.status === 'hit' ? ' · cached' : ''}`;
+    const snapshotNote = staticSnapshot ? 'Published' : 'Live';
+    const snapshotTimestamp = staticSnapshot ? (feed.snapshot_generated_at || feed.generated_at) : feed.generated_at;
+    Object.values(datasets).forEach(data => { data.source = sourceName; data.sourceUrl = sourceUrl; data.note = `${snapshotNote} ${sourceName} results · ${data.decks.length} sampled lists in the feed · updated ${formatGeneratedAt(snapshotTimestamp)}${cacheNote}${fallbackReason ? ` · public fallback: ${fallbackReason}` : ''}${sourceWarnings}`; });
+    $('#dataStatus').innerHTML = `<span class="status-dot"></span> Pioneer · ${staticSnapshot ? 'published snapshot' : fallbackReason ? 'public fallback' : sourceName}${feed.cache?.status === 'hit' ? ' · cached' : ''}`;
     const preferredArchetype = datasets[selectedArchetypeAtSwap]
       ? selectedArchetypeAtSwap
       : datasets[previousArchetype] ? previousArchetype : 'Izzet Phoenix';
@@ -598,6 +623,10 @@ async function loadLiveData({ forceRefresh = false } = {}) {
     // Draw the fresh primary sample immediately. Card profiles and smaller
     // supplements can arrive afterward without freezing the existing view.
     render();
+    // A published static site has no Python routes. The snapshot already
+    // contains its complete primary sample, so avoid a sequence of expected
+    // /api 404s for profiles and supplemental sources.
+    if (staticSnapshot) return;
     if (background) $('#syncProgressLabel').textContent = 'Primary sample updated · enriching card data and supplemental sources…';
     try { await ensureCardProfiles(selectArchetype.value); } catch (error) { console.warn(error.message); }
     render();
