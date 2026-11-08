@@ -108,6 +108,12 @@ function saveDeckNotes() {
 }
 
 function profileFor(name) { return cardProfiles.get(name); }
+function loadPublishedCardProfiles(profiles) {
+  if (!profiles || typeof profiles !== 'object') return;
+  Object.entries(profiles).forEach(([name, profile]) => {
+    if (profile && typeof profile === 'object' && profile.type_line) cardProfiles.set(name, profile);
+  });
+}
 function isLand(name) {
   const profile = profileFor(name);
   return profile ? /\bLand\b/i.test(profile.type_line) : fallbackIsLand(name);
@@ -603,6 +609,9 @@ async function loadLiveData({ forceRefresh = false } = {}) {
     // was running in the background.
     const selectedArchetypeAtSwap = selectArchetype.value;
     const selectedDeckAtSwap = selectDeck.value;
+    // Static snapshots carry public Scryfall facts for their cards. Hydrating
+    // them here restores type sections without calling the local Python API.
+    loadPublishedCardProfiles(feed.card_profiles);
     datasets = buildLiveDatasets(feed);
     mergeImportedDecks();
     if (!Object.keys(datasets).length) throw new Error('No usable Pioneer lists returned');
